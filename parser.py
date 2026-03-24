@@ -98,14 +98,54 @@ def _load_hdb() -> dict:
             messages_by_name[msg["name"].lower()] = msg
             messages_by_canid[msg["can_id"]] = msg
 
-    # --- CAN Message ECU Links (direction) ---
+    # --- CAN Message ECU Links (direction + bus discovery) ---
+    buses: dict[str, dict] = {}  # bus_id -> bus info
+
+    # Pre-populate buses from messages
+    for msg in messages_by_id.values():
+        bid = msg["bus_id"]
+        if bid and bid not in buses:
+            buses[bid] = {
+                "bus_id": bid,
+                "ecu_id": "",
+                "send_buffer": "",
+                "recv_buffer": "",
+                "send_count": 0,
+                "recv_count": 0,
+            }
+
     root = _read_xml(zf, "CanMessageEcuLinks.xml")
     if root is not None:
         for link_el in root:
             msg_guid = _text(link_el, "CanMessageId")
             usage = _text(link_el, "Usage")
+            ecu_id = _text(link_el, "VirtualEcuId")
+            buffer_id = _text(link_el, "BufferBlockObjectId")
+
             if msg_guid in messages_by_id:
                 messages_by_id[msg_guid]["direction"] = usage
+
+                # Discover per-bus ECU and buffer IDs
+                bid = messages_by_id[msg_guid]["bus_id"]
+                if bid and bid in buses:
+                    if ecu_id:
+                        buses[bid]["ecu_id"] = ecu_id
+                    if usage == "Receive":
+                        buses[bid]["recv_count"] += 1
+                        if buffer_id:
+                            buses[bid]["recv_buffer"] = buffer_id
+                    else:
+                        buses[bid]["send_count"] += 1
+                        if buffer_id:
+                            buses[bid]["send_buffer"] = buffer_id
+
+    # Build ordered bus list (deterministic order by first message appearance)
+    seen_bus_ids: list[str] = []
+    for msg in messages_by_id.values():
+        bid = msg["bus_id"]
+        if bid and bid not in seen_bus_ids:
+            seen_bus_ids.append(bid)
+    buses_list: list[dict] = [buses[bid] for bid in seen_bus_ids if bid in buses]
 
     # --- CAN Signals ---
     signals_by_id: dict[str, dict] = {}
@@ -143,6 +183,18 @@ def _load_hdb() -> dict:
 
     for msg in messages_by_id.values():
         msg["signals"].sort(key=lambda s: s["start_bit"])
+
+    # --- Discover data_type_id from first signal ---
+    data_type_id = ""
+    root_sig = _read_xml(zf, "CanSignals.xml")
+    if root_sig is not None:
+        for sig_el in root_sig:
+            sdl = sig_el.find("SignalDefinitionLayer")
+            if sdl is not None:
+                dt = _text(sdl, "DataTypeId")
+                if dt:
+                    data_type_id = dt
+                    break
 
     # --- Databases ---
     databases: list[dict] = []
@@ -240,6 +292,8 @@ def _load_hdb() -> dict:
         "messages_by_canid": messages_by_canid,
         "signals_by_id": signals_by_id,
         "signals_by_name": signals_by_name,
+        "buses": buses_list,
+        "data_type_id": data_type_id,
         "databases": databases,
         "ecu_apps": ecu_apps,
         "protocols": protocols,

@@ -66,16 +66,25 @@ def get_can_message(name: str = "", can_id: int = 0) -> str:
 
 
 @mcp.tool()
-def list_can_messages(direction: str = "", name_filter: str = "") -> str:
+def list_can_messages(direction: str = "", name_filter: str = "", bus: int = 0) -> str:
     """List all CAN messages, optionally filtered.
 
     Args:
         direction: Filter by direction — 'send', 'receive', or '' for all.
                    Matches 'Receive', 'SendCyclically', 'SendOnEvent'.
         name_filter: Filter by name substring (case-insensitive).
+        bus: Filter by bus number (1-indexed). 0 means all buses.
     """
     data = get_cache()
     messages = list(data["messages_by_id"].values())
+
+    if bus > 0:
+        buses = data.get("buses", [])
+        if bus <= len(buses):
+            bus_id = buses[bus - 1]["bus_id"]
+            messages = [m for m in messages if m["bus_id"] == bus_id]
+        else:
+            return f"Invalid bus number {bus}. Project has {len(buses)} bus(es)."
 
     if direction:
         d = direction.lower()
@@ -547,15 +556,48 @@ def update_hdb_xml(file: str, xpath: str, action: str,
 
 
 # ---------------------------------------------------------------------------
+# MCP Tools — CAN Buses
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def list_can_buses() -> str:
+    """List all CAN buses in the project with message counts and buffer IDs.
+
+    Use the bus number (1-indexed) with add_can_message to target a specific bus.
+    """
+    data = get_cache()
+    buses = data.get("buses", [])
+    if not buses:
+        return "No CAN buses found in the project."
+
+    lines = [f"**CAN Buses ({len(buses)})**\n"]
+    for i, bus in enumerate(buses, 1):
+        total = bus["send_count"] + bus["recv_count"]
+        lines.append(
+            f"  Bus {i}: {bus['bus_id']}"
+            f"  ({total} messages: {bus['send_count']} send, {bus['recv_count']} recv)"
+        )
+        lines.append(f"    ECU:         {bus['ecu_id']}")
+        lines.append(f"    Send buffer: {bus['send_buffer'] or '(none)'}")
+        lines.append(f"    Recv buffer: {bus['recv_buffer'] or '(none)'}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # MCP Tools — Add CAN Message (high-level)
 # ---------------------------------------------------------------------------
 
-# Constants from the project's HDB structure
-_BUS_ID = "0efc7807-4ab1-42f6-b245-cf4b9c90f449"
-_ECU_ID = "35d59957-4a75-481f-a9a8-44b3e8440e9d"
-_SEND_BUFFER = "10e0dca0-64bd-4508-bf53-3d9a76105bf4"
-_RECV_BUFFER = "657ff079-4b37-460c-9c7e-15a81ce3b65a"
-_DATA_TYPE_ID = "f1d98cd0-0d83-44db-b23f-74cc3ba1808e"
+def _get_bus_info(bus: int) -> dict:
+    """Get bus info by 1-indexed bus number. Raises ValueError on invalid bus."""
+    data = get_cache()
+    buses = data.get("buses", [])
+    if not buses:
+        raise ValueError("No CAN buses found in the project.")
+    if bus < 1 or bus > len(buses):
+        raise ValueError(
+            f"Invalid bus number {bus}. Project has {len(buses)} bus(es). Use 1-{len(buses)}."
+        )
+    return buses[bus - 1]
 
 
 def _sub(parent, tag, text=None):
@@ -566,11 +608,11 @@ def _sub(parent, tag, text=None):
     return el
 
 
-def _build_message_element(msg_guid, name, can_id, dlc, cycle_time):
+def _build_message_element(msg_guid, name, can_id, dlc, cycle_time, bus_id):
     """Build a complete CanMessageDataObject element."""
     msg = ET.Element("CanMessageDataObject")
     _sub(msg, "Id", msg_guid)
-    _sub(msg, "BusId", _BUS_ID)
+    _sub(msg, "BusId", bus_id)
     _sub(msg, "Name", name)
     _sub(msg, "CanId", can_id)
     _sub(msg, "ByteOrder", "DataIntel")
@@ -593,19 +635,19 @@ def _build_message_element(msg_guid, name, can_id, dlc, cycle_time):
     return msg
 
 
-def _build_ecu_link_element(msg_guid, direction):
+def _build_ecu_link_element(msg_guid, direction, ecu_id, send_buffer, recv_buffer):
     """Build a complete CanMessageEcuLinkDataObject element."""
     link = ET.Element("CanMessageEcuLinkDataObject")
-    _sub(link, "VirtualEcuId", _ECU_ID)
+    _sub(link, "VirtualEcuId", ecu_id)
     _sub(link, "CanMessageId", msg_guid)
     _sub(link, "Usage", direction)
-    buf = _RECV_BUFFER if direction == "Receive" else _SEND_BUFFER
+    buf = recv_buffer if direction == "Receive" else send_buffer
     _sub(link, "BufferBlockObjectId", buf)
     _sub(link, "CanBlockObjectId", str(uuid.uuid4()))
     return link
 
 
-def _build_signal_element(msg_guid, name, start_bit, size_bits):
+def _build_signal_element(msg_guid, name, start_bit, size_bits, data_type_id):
     """Build a complete CanSignalDataObject with all required sub-elements."""
     sig = ET.Element("CanSignalDataObject")
     _sub(sig, "Id", str(uuid.uuid4()))
@@ -616,7 +658,7 @@ def _build_signal_element(msg_guid, name, start_bit, size_bits):
 
     # SignalDefinitionLayer — all fields required by PDT
     sdl = _sub(sig, "SignalDefinitionLayer")
-    _sub(sdl, "DataTypeId", _DATA_TYPE_ID)
+    _sub(sdl, "DataTypeId", data_type_id)
     _sub(sdl, "Unit", "[-]")
     _sub(sdl, "MinValue", "VAR_MIN")
     _sub(sdl, "MaxValue", "VAR_MAX")
@@ -631,7 +673,7 @@ def _build_signal_element(msg_guid, name, start_bit, size_bits):
 
     # EcuApplicationLayer — all fields required by PDT
     eal = _sub(sig, "EcuApplicationLayer")
-    _sub(eal, "DataTypeId", _DATA_TYPE_ID)
+    _sub(eal, "DataTypeId", data_type_id)
     _sub(eal, "ScalingUnit", "[-]")
     _sub(eal, "ScalingOffset", "0")
     _sub(eal, "ScalingMultiplier", "1")
@@ -643,7 +685,7 @@ def _build_signal_element(msg_guid, name, start_bit, size_bits):
 
     # ServiceToolDefinitionLayer
     stl = _sub(sig, "ServiceToolDefinitionLayer")
-    _sub(stl, "DataTypeId", _DATA_TYPE_ID)
+    _sub(stl, "DataTypeId", data_type_id)
     _sub(stl, "ScalingUnit", "[-]")
     _sub(stl, "ScalingOffset", "0")
     _sub(stl, "ScalingMultiplier", "1")
@@ -660,6 +702,7 @@ def add_can_message(
     dlc: int = 8,
     cycle_time: int = 100,
     signals: str = "",
+    bus: int = 1,
 ) -> str:
     """Add a new CAN message to the HDB project with all required XML structure.
 
@@ -676,6 +719,8 @@ def add_can_message(
         signals: Comma-separated signal definitions as 'name:startbit:sizebits'.
                  Example: 'testValue:0:16,status:16:8'
                  Leave empty for a message with no signals.
+        bus: Bus number (1-indexed). Use list_can_buses to see available buses.
+             Default 1 (first/only bus).
     """
     valid_dirs = ("SendCyclically", "SendEventBased", "Receive")
     if direction not in valid_dirs:
@@ -683,6 +728,17 @@ def add_can_message(
 
     if dlc < 0 or dlc > 8:
         return "DLC must be 0-8."
+
+    # Look up bus info
+    try:
+        bus_info = _get_bus_info(bus)
+    except ValueError as e:
+        return str(e)
+
+    data = get_cache()
+    dt_id = data.get("data_type_id", "")
+    if not dt_id:
+        return "Cannot determine DataTypeId — no existing signals found in the project."
 
     # Parse signals
     sig_defs = []
@@ -707,7 +763,7 @@ def add_can_message(
     except Exception as e:
         return f"Error reading CanMessages.xml: {e}"
 
-    msg_el = _build_message_element(msg_guid, name, can_id, dlc, cycle_time)
+    msg_el = _build_message_element(msg_guid, name, can_id, dlc, cycle_time, bus_info["bus_id"])
     msg_root.append(msg_el)
 
     try:
@@ -721,7 +777,10 @@ def add_can_message(
     except Exception as e:
         return f"Error reading CanMessageEcuLinks.xml: {e}"
 
-    link_el = _build_ecu_link_element(msg_guid, direction)
+    link_el = _build_ecu_link_element(
+        msg_guid, direction,
+        bus_info["ecu_id"], bus_info["send_buffer"], bus_info["recv_buffer"],
+    )
     link_root.append(link_el)
 
     try:
@@ -737,7 +796,7 @@ def add_can_message(
             return f"Error reading CanSignals.xml: {e}"
 
         for sig_name, start_bit, size_bits in sig_defs:
-            sig_el = _build_signal_element(msg_guid, sig_name, start_bit, size_bits)
+            sig_el = _build_signal_element(msg_guid, sig_name, start_bit, size_bits, dt_id)
             sig_root.append(sig_el)
 
         try:

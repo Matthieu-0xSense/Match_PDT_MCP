@@ -106,8 +106,9 @@ The same `.mcp.json` works for any MATCH project — just drop it in the project
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
+| `list_can_buses` | *(none)* | List all CAN buses with message counts, ECU IDs, and send/receive buffer IDs. Use the bus number with other tools. |
 | `get_can_message` | `name: str`, `can_id: int` | Look up message by name (case-insensitive, substring match) or CAN ID (decimal). Returns details + all signals + direction. |
-| `list_can_messages` | `direction: str`, `name_filter: str` | List all messages. Filter by direction (`send`/`receive`) or name substring. |
+| `list_can_messages` | `direction: str`, `name_filter: str`, `bus: int` | List all messages. Filter by direction (`send`/`receive`), name substring, or bus number. |
 | `get_can_signal` | `name: str`, `message: str` | Look up signal by name (case-insensitive). Returns scaling, bits, units, parent message. Use `message` to disambiguate duplicates. |
 | `search_can_signals` | `query: str`, `message: str` | Search signals by name substring. Optionally restrict to signals in a specific message. |
 
@@ -115,7 +116,7 @@ The same `.mcp.json` works for any MATCH project — just drop it in the project
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `add_can_message` | `name`, `can_id`, `direction`, `dlc`, `cycle_time`, `signals` | Add a complete CAN message with signals. Creates entries in `CanMessages.xml`, `CanMessageEcuLinks.xml`, and `CanSignals.xml`. Creates `.hdb.bak` backup before the first write. |
+| `add_can_message` | `name`, `can_id`, `direction`, `dlc`, `cycle_time`, `signals`, `bus` | Add a complete CAN message with signals to a specific bus. Creates entries in `CanMessages.xml`, `CanMessageEcuLinks.xml`, and `CanSignals.xml`. Creates `.hdb.bak` backup before the first write. |
 
 **`add_can_message` details:**
 - `name` (required): Message name, e.g. `"VcuSendTestData"`
@@ -124,6 +125,9 @@ The same `.mcp.json` works for any MATCH project — just drop it in the project
 - `dlc`: Data Length Code, 0-8 (default 8)
 - `cycle_time`: Cycle time in ms (default 100)
 - `signals`: Comma-separated signal definitions as `name:startbit:sizebits`
+- `bus`: Bus number, 1-indexed (default 1). Use `list_can_buses` to see available buses
+
+Bus IDs, ECU IDs, and send/receive buffer IDs are discovered dynamically from the HDB — no hardcoded project-specific constants. This means the server works with any MATCH project, including multi-bus projects.
 
 **Example:**
 ```
@@ -133,13 +137,14 @@ add_can_message(
     direction="SendCyclically",
     dlc=8,
     cycle_time=100,
-    signals="testValue:0:16,status:16:8,mode:24:4"
+    signals="testValue:0:16,status:16:8,mode:24:4",
+    bus=1
 )
 ```
 
 This creates:
-- The message definition (CAN ID 0x18FF017C, Extended, Intel byte order)
-- ECU link with send buffer assignment
+- The message definition (CAN ID 0x18FF017C, Extended, Intel byte order) on bus 1
+- ECU link with the correct send buffer for that bus
 - 3 signals: `testValue` (16-bit at bit 0), `status` (8-bit at bit 16), `mode` (4-bit at bit 24)
 
 ### Database & ECU Tools (from XML)
@@ -181,7 +186,7 @@ These tools are optional. Without .NET SDK, they return an error message; all ot
 |------|---------|
 | `CanMessages.xml` | CAN message definitions (ID, DLC, cycle time, byte order) |
 | `CanSignals.xml` | Signal definitions (bit position, scaling, units, min/max) |
-| `CanMessageEcuLinks.xml` | Send/receive direction per message |
+| `CanMessageEcuLinks.xml` | Send/receive direction, ECU assignment, and buffer block per message (used for dynamic bus discovery) |
 | `DatabaseLists.xml` | NvMem/RAM database layouts |
 | `EcuApplications.xml` | ECU config (cycle time, watchdog) |
 | `Protocols.xml` | Protocol instances (MST, ISO-Bus) |

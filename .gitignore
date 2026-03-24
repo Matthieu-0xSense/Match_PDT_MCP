@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# .NET
+dotnet-helper/bin/
+dotnet-helper/obj/
+
+# IDE
+.idea/
+.vs/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backups
+*.bak

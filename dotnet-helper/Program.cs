@@ -3,18 +3,20 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.Serialization.Formatters.Binary;
 using System.Text.Json;
 
 #pragma warning disable SYSLIB0011 // BinaryFormatter is obsolete
+#pragma warning disable CS8632     // Nullable annotations outside #nullable context
 
 /// <summary>
 /// Deserializes .dat files from a HYDAC PDT .hdb archive using BinaryFormatter
 /// and the PDT .NET assemblies. Outputs JSON to stdout.
 ///
-/// Usage: HdbDatReader &lt;hdb_path&gt; &lt;pdt_dir&gt; &lt;command&gt;
-///   commands: errors, compileconfig, isobus
+/// Usage: HdbDatReader &lt;hdb_path&gt; &lt;pdt_dir&gt; &lt;command&gt; [args]
+///   commands: errors, compileconfig, isobus, dump &lt;file&gt;, dump-all, list-dat
 /// </summary>
 class Program
 {
@@ -22,8 +24,8 @@ class Program
     {
         if (args.Length < 3)
         {
-            Console.Error.WriteLine("Usage: HdbDatReader <hdb_path> <pdt_dir> <command>");
-            Console.Error.WriteLine("  commands: errors, compileconfig, isobus");
+            Console.Error.WriteLine("Usage: HdbDatReader <hdb_path> <pdt_dir> <command> [args]");
+            Console.Error.WriteLine("  commands: errors, compileconfig, isobus, dump <file>, dump-all, list-dat");
             return 1;
         }
 
@@ -59,6 +61,9 @@ class Program
                 "errors" => ReadErrors(zip),
                 "compileconfig" => ReadCompileConfig(zip),
                 "isobus" => ReadIsobus(zip),
+                "list-dat" => ListDatFiles(zip),
+                "dump" => DumpDatFile(zip, args.Length > 3 ? args[3] : throw new ArgumentException("dump requires a filename argument")),
+                "dump-all" => DumpAllDatFiles(zip),
                 _ => throw new ArgumentException($"Unknown command: {command}")
             };
             Console.Write(json);
@@ -86,6 +91,10 @@ class Program
         var formatter = new BinaryFormatter();
         return formatter.Deserialize(ms);
     }
+
+    // -----------------------------------------------------------------------
+    // Curated commands (existing)
+    // -----------------------------------------------------------------------
 
     static string ReadErrors(ZipArchive zip)
     {
@@ -152,6 +161,64 @@ class Program
         return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
     }
 
+    // -----------------------------------------------------------------------
+    // Generic dump commands (new)
+    // -----------------------------------------------------------------------
+
+    static string ListDatFiles(ZipArchive zip)
+    {
+        var files = new List<object>();
+        foreach (var entry in zip.Entries)
+        {
+            if (entry.Name.EndsWith(".dat", StringComparison.OrdinalIgnoreCase))
+            {
+                files.Add(new
+                {
+                    name = entry.FullName,
+                    size = entry.Length,
+                    compressed = entry.CompressedLength
+                });
+            }
+        }
+        return JsonSerializer.Serialize(files, new JsonSerializerOptions { WriteIndented = true });
+    }
+
+    static string DumpDatFile(ZipArchive zip, string filename)
+    {
+        var obj = Deserialize(zip, filename);
+        var dumped = ObjectDumper.Dump(obj);
+        return JsonSerializer.Serialize(dumped, new JsonSerializerOptions { WriteIndented = true });
+    }
+
+    static string DumpAllDatFiles(ZipArchive zip)
+    {
+        var result = new Dictionary<string, object>();
+        foreach (var entry in zip.Entries)
+        {
+            if (!entry.Name.EndsWith(".dat", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            try
+            {
+                var obj = Deserialize(zip, entry.FullName);
+                result[entry.FullName] = ObjectDumper.Dump(obj);
+            }
+            catch (Exception ex)
+            {
+                result[entry.FullName] = new Dictionary<string, string>
+                {
+                    { "$error", ex.Message }
+                };
+            }
+        }
+        // Compact JSON for dump-all (can be large)
+        return JsonSerializer.Serialize(result);
+    }
+
+    // -----------------------------------------------------------------------
+    // Reflection helpers (existing)
+    // -----------------------------------------------------------------------
+
     static object? GetProp(object obj, string name)
     {
         return obj.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.Instance)?.GetValue(obj);
@@ -167,4 +234,132 @@ class Program
         }
         return default!;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Generic recursive object walker
+// ---------------------------------------------------------------------------
+
+static class ObjectDumper
+{
+    private const int MaxDepth = 20;
+    private const int MaxCollectionItems = 500;
+
+    // Namespaces to skip (UI/threading types that carry no config data)
+    private static readonly HashSet<string> SkipNamespaces = new HashSet<string>
+    {
+        "System.Windows.Threading",
+        "System.Windows.Media",
+        "System.Windows.Controls",
+        "System.ComponentModel",
+    };
+
+    public static object Dump(object obj)
+    {
+        return DumpInternal(obj, MaxDepth, new HashSet<object>(ReferenceEqualityComparer.Instance));
+    }
+
+    private static object DumpInternal(object obj, int depth, HashSet<object> visited)
+    {
+        if (obj == null)
+            return null;
+
+        var type = obj.GetType();
+
+        // Primitives and simple types — return directly
+        if (obj is string s) return s;
+        if (obj is bool) return obj;
+        if (type.IsPrimitive) return obj;
+        if (obj is decimal d) return d;
+        if (obj is DateTime dt) return dt.ToString("o");
+        if (obj is DateTimeOffset dto) return dto.ToString("o");
+        if (obj is TimeSpan ts) return ts.ToString();
+        if (obj is Guid g) return g.ToString();
+        if (obj is byte[] bytes) return Convert.ToBase64String(bytes);
+        if (type.IsEnum) return obj.ToString();
+        if (obj is Uri uri) return uri.ToString();
+        if (obj is Type t) return t.FullName;
+
+        // Depth guard
+        if (depth <= 0)
+            return "$max-depth";
+
+        // Already-seen detection (prevents exponential blowup on shared objects)
+        // Objects stay in visited permanently — revisits get "$seen: TypeName"
+        if (!type.IsValueType)
+        {
+            if (!visited.Add(obj))
+                return "$seen: " + type.Name;
+        }
+
+        // IDictionary — dump as key-value pairs
+        if (obj is IDictionary dict)
+        {
+            var result = new Dictionary<string, object>();
+            result["$type"] = type.Name;
+            int count = 0;
+            foreach (DictionaryEntry entry in dict)
+            {
+                if (count++ >= MaxCollectionItems) break;
+                var key = entry.Key?.ToString() ?? "$null";
+                result[key] = DumpInternal(entry.Value, depth - 1, visited);
+            }
+            return result;
+        }
+
+        // IEnumerable (but not string/byte[]) — dump as array
+        if (obj is IEnumerable enumerable)
+        {
+            var list = new List<object>();
+            int count = 0;
+            foreach (var item in enumerable)
+            {
+                if (count++ >= MaxCollectionItems) break;
+                list.Add(DumpInternal(item, depth - 1, visited));
+            }
+            return list;
+        }
+
+        // Complex object — dump all public instance properties
+        var props = new Dictionary<string, object>();
+        props["$type"] = type.Name;
+
+        foreach (var prop in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+        {
+            // Skip indexers
+            if (prop.GetIndexParameters().Length > 0)
+                continue;
+
+            // Skip delegate properties (event handlers)
+            if (typeof(Delegate).IsAssignableFrom(prop.PropertyType))
+                continue;
+
+            // Skip properties from UI/threading namespaces
+            if (prop.PropertyType.Namespace != null &&
+                SkipNamespaces.Contains(prop.PropertyType.Namespace))
+                continue;
+
+            try
+            {
+                var val = prop.GetValue(obj);
+                props[prop.Name] = DumpInternal(val, depth - 1, visited);
+            }
+            catch (Exception ex)
+            {
+                props[prop.Name] = "$error: " + (ex.InnerException?.Message ?? ex.Message);
+            }
+        }
+        return props;
+    }
+}
+
+/// <summary>
+/// Reference equality comparer for circular reference detection.
+/// </summary>
+class ReferenceEqualityComparer : IEqualityComparer<object>
+{
+    public static readonly ReferenceEqualityComparer Instance = new ReferenceEqualityComparer();
+
+    public new bool Equals(object x, object y) => ReferenceEquals(x, y);
+    public int GetHashCode(object obj) => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj);
 }

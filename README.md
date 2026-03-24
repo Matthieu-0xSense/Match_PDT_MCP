@@ -39,8 +39,8 @@ The PDT generates C code in `AUTO_CEN_*` folders — structs, enums, config arra
 **Required:**
 - Python 3.10+ with `mcp` package
 
-**Optional (for error tools only):**
-- .NET SDK 8.0+
+**Optional (for .dat file tools):**
+- .NET SDK 8.0+ (builds the helper targeting .NET Framework 4.8)
 - HYDAC PDT installed (provides the .NET assemblies for `.dat` deserialization)
 
 Without .NET SDK, all tools work except `list_errors` and `get_error` — they return an error message instead of crashing the server.
@@ -204,20 +204,30 @@ These tools are optional. Without .NET SDK, they return an error message; all ot
 | `PinEcuApplicationLinks.xml` | I/O pin mappings (GUIDs only) |
 | `info.xml` | PDT version and file format |
 
-### Binary .dat Files (read-only via .NET helper)
+### Binary .dat Files (via .NET helper)
 
 | File | Status | Content |
 |------|--------|---------|
-| `Errors.dat` | Read-only | Error definitions (SPN, severity, thresholds, reactions) |
-| `CompileConfig.dat` | Read-only | Build mode, log level, flags |
-| `Isobus.dat` | Read-only | ISOBUS configuration |
-| `project.dat` | Not supported | Main project data (pins, blocks) — uses complex WPF types |
+| `Errors.dat` | Curated read | Error definitions (SPN, severity, thresholds, reactions) |
+| `CompileConfig.dat` | Curated read | Build mode, log level, flags |
+| `Isobus.dat` | Curated read | ISOBUS configuration |
+| `project.dat` | Generic dump | Main project data (pins, blocks, FMI definitions) |
+| All .dat files | Generic dump | Full JSON dump via `dump` / `dump-all` commands |
+
+### HDB Diff Tool
+
+Compare two `.hdb` files semantically:
+
+```bash
+python hdb_diff.py <hdb_a> <hdb_b> [--output report.md]
+```
+
+Compares all XML files (element-level by ID/Name) and all .dat files (JSON deep-diff). Outputs a markdown report showing added/removed/changed elements.
 
 ## Limitations
 
-- **`.dat` files are read-only** — BinaryFormatter serialization with proprietary PDT types prevents write-back.
-- **`project.dat`** uses .NET Framework 4.8 WPF types that can't be loaded in .NET 8. Pin names and software blocks are not available.
-- **Pin name resolution** requires cross-referencing GUIDs through `project.dat`, so pin info shows only GUIDs.
+- **`.dat` files are read-only** — BinaryFormatter serialization with proprietary PDT types prevents write-back. The generic `dump` command can read all .dat files to JSON for diffing.
+- **Pin name resolution** requires cross-referencing GUIDs through `project.dat`. The `dump project.dat` command now exposes pin data.
 - **Error GUID fields** (Fmi, DetectionMethod, MachineFunction, RestrictedMode) reference objects in `project.dat` and can't be resolved to names.
 - **Signal name duplicates** — many signals share the same name across different messages. Use the `message` parameter in `get_can_signal` to disambiguate.
 
@@ -227,6 +237,6 @@ These tools are optional. Without .NET SDK, they return an error message; all ot
 - Python 3.10+
 - `mcp` package (`pip install "mcp[cli]"`)
 
-**Optional (error tools only):**
-- .NET SDK 8.0+
-- HYDAC PDT installation (provides the .NET assemblies)
+**Optional (for .dat file tools and diff):**
+- .NET SDK 8.0+ (to build the helper)
+- HYDAC PDT installation (provides the .NET assemblies for deserialization)

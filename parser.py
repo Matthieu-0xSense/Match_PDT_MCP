@@ -327,18 +327,26 @@ def clear_cache() -> None:
 # Dotnet helper (for .dat file parsing)
 # ---------------------------------------------------------------------------
 
-def _run_dotnet_helper(command: str) -> list | dict:
+_DOTNET_HELPER_EXE = os.path.join(DOTNET_HELPER, "bin", "Release", "net48", "HdbDatReader.exe")
+
+
+def _run_dotnet_helper(command: str, timeout: int = 30) -> list | dict:
     """Run the dotnet helper and return parsed JSON."""
     if not PDT_DIR:
         raise RuntimeError("PDT_DIR environment variable not set. Point it to the PDT installation directory.")
     if not HDB_PATH:
         raise RuntimeError("HDB_PATH environment variable not set.")
 
+    exe = _DOTNET_HELPER_EXE
+    if os.path.exists(exe):
+        cmd = [exe, HDB_PATH, PDT_DIR] + command.split()
+    else:
+        cmd = ["dotnet", "run", "-c", "Release", "--", HDB_PATH, PDT_DIR] + command.split()
+
     result = subprocess.run(
-        ["dotnet", "run", "-c", "Release", "--",
-         HDB_PATH, PDT_DIR, command],
+        cmd,
         cwd=DOTNET_HELPER,
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=timeout,
     )
     if result.returncode != 0:
         raise RuntimeError(f"dotnet helper failed: {result.stderr.strip()}")
@@ -350,6 +358,21 @@ def get_errors() -> list[dict]:
     if "errors" not in _cache:
         _cache["errors"] = _run_dotnet_helper("errors")
     return _cache["errors"]
+
+
+def dump_dat(filename: str) -> dict:
+    """Dump a single .dat file to JSON via the dotnet helper."""
+    return _run_dotnet_helper(f"dump {filename}", timeout=120)
+
+
+def dump_all_dats() -> dict:
+    """Dump all .dat files from the HDB to JSON."""
+    return _run_dotnet_helper("dump-all", timeout=120)
+
+
+def list_dat_files() -> list[dict]:
+    """List all .dat files in the HDB archive with sizes."""
+    return _run_dotnet_helper("list-dat")
 
 
 # ---------------------------------------------------------------------------

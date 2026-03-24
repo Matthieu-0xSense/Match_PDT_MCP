@@ -147,6 +147,16 @@ This creates:
 - ECU link with the correct send buffer for that bus
 - 3 signals: `testValue` (16-bit at bit 0), `status` (8-bit at bit 16), `mode` (4-bit at bit 24)
 
+**Visual walkthrough:**
+
+Adding a CAN message from Claude Code:
+
+![Claude Code adding a CAN message](img/Claude_code_add_CAN_message.png)
+
+The resulting message in the PDT:
+
+![CAN message in PDT](img/PDT_CAN_message.png)
+
 ### Database & ECU Tools (from XML)
 
 | Tool | Parameters | Description |

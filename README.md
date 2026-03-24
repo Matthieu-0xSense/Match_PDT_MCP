@@ -27,10 +27,12 @@ The PDT generates C code in `AUTO_CEN_*` folders — structs, enums, config arra
 - Pin configurations (`project.dat` uses complex .NET types that can't be loaded outside .NET Framework 4.8)
 - Software blocks and detailed parameter entries within databases
 
-**What cannot be modified (binary .dat files):**
+**What can also be modified (binary .dat — via .NET helper):**
+- Database variables in `project.dat` — add, update, delete parameters across NvMem/RAM databases
+
+**What cannot be modified:**
 - Error definitions (`Errors.dat`)
 - ISOBUS config (`Isobus.dat`)
-- Project data (`project.dat`)
 
 ## Installation
 
@@ -157,11 +159,16 @@ The resulting message in the PDT:
 
 ![CAN message in PDT](img/PDT_CAN_message.png)
 
-### Database & ECU Tools (from XML)
+### Database & ECU Tools (from XML + .dat via .NET helper)
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
 | `list_databases` | *(none)* | List NvMem/RAM parameter databases with addresses and settings. |
+| `list_db_variables` | `database: str` | List all variables in a database (or all databases if empty) with type, default, range, unit. |
+| `get_db_variable` | `database: str`, `variable: str` | Get detailed info for a single variable including access levels and dataset values. |
+| `add_db_variable` | `database`, `name`, `type`, `default`, `min`, `max`, `unit`, `description` | Add a new variable to a database. Clones from an existing variable of the same type. Creates `.hdb.bak` backup. |
+| `update_db_variable` | `database`, `variable`, `default`, `min`, `max`, `unit`, `description` | Update properties of an existing variable. Only provided fields are changed. |
+| `delete_db_variable` | `database: str`, `variable: str` | Remove a variable from a database. |
 | `get_ecu_config` | *(none)* | ECU app config: cycle time, watchdog, protocols, protocol parameters, project info. |
 
 ### Error Tools (from .dat via .NET helper — requires .NET SDK 8.0+ and HYDAC PDT)
@@ -211,7 +218,7 @@ These tools are optional. Without .NET SDK, they return an error message; all ot
 | `Errors.dat` | Curated read | Error definitions (SPN, severity, thresholds, reactions) |
 | `CompileConfig.dat` | Curated read | Build mode, log level, flags |
 | `Isobus.dat` | Curated read | ISOBUS configuration |
-| `project.dat` | Generic dump | Main project data (pins, blocks, FMI definitions) |
+| `project.dat` | Read + write | Main project data (pins, blocks, FMI definitions). Database variables are read/write. |
 | All .dat files | Generic dump | Full JSON dump via `dump` / `dump-all` commands |
 
 ### HDB Diff Tool
@@ -226,7 +233,7 @@ Compares all XML files (element-level by ID/Name) and all .dat files (JSON deep-
 
 ## Limitations
 
-- **`.dat` files are read-only** — BinaryFormatter serialization with proprietary PDT types prevents write-back. The generic `dump` command can read all .dat files to JSON for diffing.
+- **Most `.dat` files are read-only** — only database variables in `project.dat` support write-back. The generic `dump` command can read all .dat files to JSON for diffing.
 - **Pin name resolution** requires cross-referencing GUIDs through `project.dat`. The `dump project.dat` command now exposes pin data.
 - **Error GUID fields** (Fmi, DetectionMethod, MachineFunction, RestrictedMode) reference objects in `project.dat` and can't be resolved to names.
 - **Signal name duplicates** — many signals share the same name across different messages. Use the `message` parameter in `get_can_signal` to disambiguate.

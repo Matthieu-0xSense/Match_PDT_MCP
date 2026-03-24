@@ -16,6 +16,11 @@ from parser import (
     HDB_PATH, PDT_DIR,
     get_cache, clear_cache, get_errors,
     read_xml_from_hdb, write_xml_to_hdb,
+    list_db_variables as _list_db_variables,
+    get_db_variable as _get_db_variable,
+    add_db_variable as _add_db_variable,
+    update_db_variable as _update_db_variable,
+    delete_db_variable as _delete_db_variable,
 )
 from formatters import fmt_can_id, fmt_message, fmt_signal
 
@@ -23,7 +28,8 @@ mcp = FastMCP(
     "Match_PDT_MCP",
     instructions=(
         "Query CAN messages, signals, parameters, and ECU config "
-        "from a HYDAC PDT .hdb project file."
+        "from a HYDAC PDT .hdb project file. "
+        "Also manage database variables (list, get, add, update, delete)."
     ),
 )
 
@@ -277,6 +283,226 @@ def get_ecu_config() -> str:
         lines.append("  (Pin names require project.dat — only GUIDs available)")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# MCP Tools — DB Variables
+# ---------------------------------------------------------------------------
+
+VALID_VAR_TYPES = {"TBOOLEAN", "TUINT8", "TUINT16", "TINT16", "TUINT32", "TFLOAT32"}
+
+
+def _fmt_var_compact(v: dict) -> str:
+    """Format a variable as a compact one-line string."""
+    return (
+        f"  {v['name']:35s}  {v['var_type']:10s}  "
+        f"def={v['default_value']:>8s}  [{v['min']}..{v['max']}]  "
+        f"{v['unit']:8s}  {v['description']}"
+    )
+
+
+@mcp.tool()
+def list_db_variables(database: str = "") -> str:
+    """List all variables in a database with their type, default, range, and unit.
+
+    Requires PDT_DIR environment variable.
+
+    Args:
+        database: Database name (e.g. 'NvMemSensors'). Empty to list all variables.
+    """
+    try:
+        variables = _list_db_variables(database)
+    except Exception as e:
+        return f"Error: {e}"
+
+    if not variables:
+        return f"No variables found" + (f" in database '{database}'" if database else "") + "."
+
+    # Group by database
+    if not database:
+        grouped: dict[str, list] = {}
+        for v in variables:
+            db = v.get("database", "?")
+            grouped.setdefault(db, []).append(v)
+
+        lines = [f"**DB Variables ({len(variables)} total)**\n"]
+        for db_name in sorted(grouped.keys()):
+            db_vars = sorted(grouped[db_name], key=lambda v: v.get("idx", 0))
+            lines.append(f"\n**{db_name}** ({len(db_vars)} variables)")
+            for v in db_vars:
+                lines.append(_fmt_var_compact(v))
+        return "\n".join(lines)
+
+    variables.sort(key=lambda v: v.get("idx", 0))
+    lines = [f"**{database}** ({len(variables)} variables)\n"]
+    for v in variables:
+        lines.append(_fmt_var_compact(v))
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_db_variable(database: str, variable: str) -> str:
+    """Get detailed info for one database variable including access levels and dataset values.
+
+    Requires PDT_DIR environment variable.
+
+    Args:
+        database: Database name (e.g. 'NvMemSensors').
+        variable: Variable name (case-insensitive, e.g. 'usSensorSor').
+    """
+    try:
+        v = _get_db_variable(database, variable)
+    except Exception as e:
+        return f"Error: {e}"
+
+    lines = [
+        f"**{v['name']}** ({v['database']})",
+        f"  Type: {v['var_type']} (prefix: {v['type_prefix']}, byte: {v['var_type_byte']})",
+        f"  Default: {v['default_value']}",
+        f"  Range: [{v['min']} .. {v['max']}]",
+        f"  Unit: {v['unit']}",
+        f"  Description: {v['description']}",
+    ]
+    if v.get("notes"):
+        lines.append(f"  Notes: {v['notes']}")
+    lines.extend([
+        f"  CommID: {v['comm_id']}  |  Idx: {v['idx']}  |  NvMem Address: {v['nv_mem_address']}",
+        f"  GUID: {v['guid']}",
+        f"  HST Scaling: offset={v['hst_scaling_offset']} factor={v['hst_scaling_factor']} unit={v['hst_scaling_unit']}",
+    ])
+
+    if v.get("access_levels"):
+        lines.append(f"  Access Levels:")
+        for role, access in v["access_levels"].items():
+            lines.append(f"    {role}: {access}")
+
+    if v.get("dataset_values"):
+        lines.append(f"  Dataset Values:")
+        for ds in v["dataset_values"]:
+            lines.append(f"    [{ds['index']}] = {ds['value']}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def add_db_variable(
+    database: str,
+    name: str,
+    type: str,
+    default: str,
+    min: str = "",
+    max: str = "",
+    unit: str = "[-]",
+    description: str = "",
+) -> str:
+    """Add a new variable to a database in the HDB project.
+
+    Creates a .hdb.bak backup before the first modification.
+    The variable is cloned from an existing variable of the same type to ensure
+    all internal PDT fields are correctly initialized.
+    Requires PDT_DIR environment variable.
+
+    Args:
+        database: Database name (e.g. 'NvMemSensors').
+        name: Variable name in camelCase without type prefix (e.g. 'radarFilterGain').
+              The type prefix (e.g. 'u16', 'bo') is added automatically by PDT.
+        type: Data type. One of: TBOOLEAN, TUINT8, TUINT16, TINT16, TUINT32, TFLOAT32.
+        default: Default value (e.g. '100', 'TRUE', '3.14').
+        min: Minimum value. Empty uses the type default (e.g. 'U16_MIN').
+        max: Maximum value. Empty uses the type default (e.g. 'U16_MAX').
+        unit: Unit string (e.g. 'mm', 'ms', '[-]'). Default '[-]'.
+        description: Human-readable description.
+    """
+    type_upper = type.upper()
+    if type_upper not in VALID_VAR_TYPES:
+        return f"Invalid type '{type}'. Must be one of: {', '.join(sorted(VALID_VAR_TYPES))}"
+
+    try:
+        result = _add_db_variable(database, name, type_upper, default, min, max, unit, description)
+    except Exception as e:
+        return f"Error: {e}"
+
+    if result.get("status") == "ok":
+        return (
+            f"OK — Added variable '{result['name']}' to {result['database']}.\n"
+            f"  Type: {result['var_type']}  Default: {result['default_value']}\n"
+            f"  Range: [{result['min']} .. {result['max']}]  Unit: {result.get('unit', '[-]')}\n"
+            f"  CommID: {result['comm_id']}  Idx: {result['idx']}  GUID: {result['guid']}\n"
+            f"\nCache cleared. Use reload_hdb to verify."
+        )
+    return f"Unexpected result: {result}"
+
+
+@mcp.tool()
+def update_db_variable(
+    database: str,
+    variable: str,
+    default: str = "",
+    min: str = "",
+    max: str = "",
+    unit: str = "",
+    description: str = "",
+) -> str:
+    """Modify properties of an existing database variable in the HDB project.
+
+    Only provided (non-empty) arguments are changed; omit or leave empty to keep current value.
+    Creates a .hdb.bak backup before the first modification.
+    Requires PDT_DIR environment variable.
+
+    Args:
+        database: Database name (e.g. 'NvMemSensors').
+        variable: Variable name (case-insensitive, e.g. 'usSensorSor').
+        default: New default value. Empty to keep current.
+        min: New minimum value. Empty to keep current.
+        max: New maximum value. Empty to keep current.
+        unit: New unit string. Empty to keep current.
+        description: New description. Empty to keep current.
+    """
+    kwargs = {}
+    if default:
+        kwargs["default"] = default
+    if min:
+        kwargs["min"] = min
+    if max:
+        kwargs["max"] = max
+    if unit:
+        kwargs["unit"] = unit
+    if description:
+        kwargs["description"] = description
+
+    if not kwargs:
+        return "No changes specified. Provide at least one of: default, min, max, unit, description."
+
+    try:
+        result = _update_db_variable(database, variable, **kwargs)
+    except Exception as e:
+        return f"Error: {e}"
+
+    if result.get("status") == "ok":
+        changes = ", ".join(f"{k}={v}" for k, v in kwargs.items())
+        return f"OK — Updated '{result['name']}' in {result['database']}: {changes}\nCache cleared."
+    return f"Unexpected result: {result}"
+
+
+@mcp.tool()
+def delete_db_variable(database: str, variable: str) -> str:
+    """Remove a variable from a database in the HDB project.
+
+    Creates a .hdb.bak backup before the first modification.
+    Requires PDT_DIR environment variable.
+
+    Args:
+        database: Database name (e.g. 'NvMemSensors').
+        variable: Variable name to delete (case-insensitive).
+    """
+    try:
+        result = _delete_db_variable(database, variable)
+    except Exception as e:
+        return f"Error: {e}"
+
+    if result.get("status") == "ok":
+        return f"OK — Deleted '{result['name']}' from {result['database']}.\nCache cleared."
+    return f"Unexpected result: {result}"
 
 
 # ---------------------------------------------------------------------------

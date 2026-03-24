@@ -33,7 +33,13 @@ PDT_DIR = os.environ.get("PDT_DIR", "")
 if not PDT_DIR:
     _pdt_base = r"C:\Program Files\Hydac\Project Definition Tool"
     if os.path.isdir(_pdt_base):
-        _versions = sorted(os.listdir(_pdt_base), reverse=True)
+        # Sort by semantic version (split on dots, compare as integers)
+        def _version_key(v):
+            try:
+                return tuple(int(p) for p in v.split("."))
+            except ValueError:
+                return (0,)
+        _versions = sorted(os.listdir(_pdt_base), key=_version_key, reverse=True)
         if _versions:
             PDT_DIR = os.path.join(_pdt_base, _versions[0])
 
@@ -330,8 +336,14 @@ def clear_cache() -> None:
 _DOTNET_HELPER_EXE = os.path.join(DOTNET_HELPER, "bin", "Release", "net48", "HdbDatReader.exe")
 
 
-def _run_dotnet_helper(command: str, timeout: int = 30) -> list | dict:
-    """Run the dotnet helper and return parsed JSON."""
+def _run_dotnet_helper(command: str, timeout: int = 30, stdin_data: str = None) -> list | dict:
+    """Run the dotnet helper and return parsed JSON.
+
+    Args:
+        command: Space-separated command and arguments.
+        timeout: Timeout in seconds.
+        stdin_data: Optional JSON string to pass via stdin (for write commands).
+    """
     if not PDT_DIR:
         raise RuntimeError("PDT_DIR environment variable not set. Point it to the PDT installation directory.")
     if not HDB_PATH:
@@ -347,6 +359,7 @@ def _run_dotnet_helper(command: str, timeout: int = 30) -> list | dict:
         cmd,
         cwd=DOTNET_HELPER,
         capture_output=True, text=True, timeout=timeout,
+        input=stdin_data,
     )
     if result.returncode != 0:
         raise RuntimeError(f"dotnet helper failed: {result.stderr.strip()}")
@@ -373,6 +386,63 @@ def dump_all_dats() -> dict:
 def list_dat_files() -> list[dict]:
     """List all .dat files in the HDB archive with sizes."""
     return _run_dotnet_helper("list-dat")
+
+
+# ---------------------------------------------------------------------------
+# DB variable queries & mutations
+# ---------------------------------------------------------------------------
+
+def list_db_variables(database: str = "") -> list[dict]:
+    """List all variables in a database (or all databases)."""
+    cmd = f"db-list-vars {database}" if database else "db-list-vars"
+    return _run_dotnet_helper(cmd, timeout=30)
+
+
+def get_db_variable(database: str, variable: str) -> dict:
+    """Get detailed info for one database variable."""
+    return _run_dotnet_helper(f"db-get-var {database} {variable}", timeout=30)
+
+
+def add_db_variable(database: str, name: str, var_type: str, default: str,
+                    min_val: str = "", max_val: str = "", unit: str = "[-]",
+                    description: str = "") -> dict:
+    """Add a new variable to a database. Returns the created variable info."""
+    payload = json.dumps({
+        "database": database,
+        "name": name,
+        "type": var_type,
+        "default": default,
+        "min": min_val,
+        "max": max_val,
+        "unit": unit,
+        "description": description,
+    })
+    result = _run_dotnet_helper("db-add-var", timeout=60, stdin_data=payload)
+    clear_cache()
+    return result
+
+
+def update_db_variable(database: str, variable: str, **kwargs) -> dict:
+    """Update properties of an existing database variable.
+
+    Keyword args: default, min, max, unit, description.
+    Only provided kwargs are changed.
+    """
+    payload = {"database": database, "variable": variable}
+    for key in ("default", "min", "max", "unit", "description"):
+        if key in kwargs and kwargs[key] is not None:
+            payload[key] = kwargs[key]
+    result = _run_dotnet_helper("db-update-var", timeout=60, stdin_data=json.dumps(payload))
+    clear_cache()
+    return result
+
+
+def delete_db_variable(database: str, variable: str) -> dict:
+    """Delete a variable from a database."""
+    payload = json.dumps({"database": database, "variable": variable})
+    result = _run_dotnet_helper("db-delete-var", timeout=60, stdin_data=payload)
+    clear_cache()
+    return result
 
 
 # ---------------------------------------------------------------------------

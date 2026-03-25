@@ -401,6 +401,26 @@ def list_dat_files() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Error GUID resolution queries
+# ---------------------------------------------------------------------------
+
+def get_detection_methods(filter: str = "") -> list[dict]:
+    """List detection methods from project.dat. Optional name filter."""
+    cmd = f"err-list-dms {filter}" if filter else "err-list-dms"
+    return _run_dotnet_helper(cmd, timeout=60)
+
+
+def get_fmi_definitions() -> dict:
+    """List FMI and FMI extension definitions from project.dat."""
+    return _run_dotnet_helper("err-list-fmis", timeout=60)
+
+
+def get_error_templates() -> list[dict]:
+    """List error templates from project.dat."""
+    return _run_dotnet_helper("err-list-templates", timeout=60)
+
+
+# ---------------------------------------------------------------------------
 # DB variable queries & mutations
 # ---------------------------------------------------------------------------
 

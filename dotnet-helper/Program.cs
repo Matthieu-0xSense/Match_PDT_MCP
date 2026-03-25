@@ -88,6 +88,9 @@ class Program
                 "db-list-vars" => DbListVars(zip, args.Length > 3 ? args[3] : ""),
                 "db-get-var" => DbGetVar(zip, args.Length > 3 ? args[3] : throw new ArgumentException("db-get-var requires database name"),
                                               args.Length > 4 ? args[4] : throw new ArgumentException("db-get-var requires variable name")),
+                "err-list-dms" => ReadDetectionMethods(zip, args.Length > 3 ? args[3] : ""),
+                "err-list-fmis" => ReadFmiDefinitions(zip),
+                "err-list-templates" => ReadErrorTemplates(zip),
                 _ => throw new ArgumentException($"Unknown command: {command}")
             };
             Console.Write(result);
@@ -146,6 +149,12 @@ class Program
                 comment = GetPropValue<string>(error, "Comment") ?? "",
                 symbol = GetPropValue<string>(error, "Symbol") ?? "",
                 error_info_page = GetPropValue<int>(error, "ErrorInformationPageIndex"),
+                object_id = GetPropValue<string>(error, "ObjectId") ?? "",
+                owner_id = GetPropValue<string>(error, "OwnerId") ?? "",
+                detection_method = GetPropValue<string>(error, "DetectionMethod") ?? "",
+                fmi = GetPropValue<string>(error, "Fmi") ?? "",
+                fmi_extended = GetPropValue<string>(error, "FmiExtended") ?? "",
+                restricted_mode = reactionProps != null ? (GetPropValue<string>(reactionProps, "RestrictedMode") ?? "") : "",
                 set_debounce_enabled = setProps != null && GetPropValue<bool>(setProps, "IsDebounceEnabled"),
                 set_debounce_ms = setProps != null ? GetPropValue<int>(setProps, "DebounceTime") : 0,
                 set_threshold = setProps != null ? GetPropValue<int>(setProps, "Threshold") : 0,
@@ -154,6 +163,173 @@ class Program
                 release_threshold = releaseProps != null ? GetPropValue<int>(releaseProps, "Threshold") : 0,
                 reaction_advanced_info = reactionProps != null ? GetPropValue<int>(reactionProps, "AdvancedErrorInformation") : 0,
             });
+        }
+
+        return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+    }
+
+    static string ReadDetectionMethods(ZipArchive zip, string filter)
+    {
+        var dataLayer = Deserialize(zip, "project.dat");
+        var repo = GetProp(dataLayer, "Repo");
+        if (repo == null) return "[]";
+
+        var result = new List<object>();
+
+        // Read custom detection method templates from DetectionMethodData
+        var repoProject = GetProp(repo, "RepoProject");
+        var detail = repoProject != null ? GetProp(repoProject, "Detail") : null;
+        var dmData = detail != null ? GetProp(detail, "DetectionMethodData") : null;
+
+        if (dmData != null)
+        {
+            foreach (var setName in new[] { "Custom", "Default" })
+            {
+                var templateSet = GetProp(dmData, setName);
+                if (templateSet == null) continue;
+                var dms = GetProp(templateSet, "DetectionMethods") as IList;
+                if (dms == null) continue;
+
+                foreach (var dm in dms)
+                {
+                    if (dm == null || dm is string) continue;
+                    var detection = GetPropValue<string>(dm, "Detection") ?? "";
+                    if (!string.IsNullOrEmpty(filter) &&
+                        detection.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0)
+                        continue;
+
+                    result.Add(new
+                    {
+                        detection = detection,
+                        detection_vm = GetPropValue<string>(dm, "DetectionVm") ?? "",
+                        detection_method_name = GetPropValue<string>(dm, "DetectionMethodName") ?? "",
+                        bit = GetPropValue<int>(dm, "Bit"),
+                        default_fmi = GetPropValue<int>(dm, "DefaultFmi"),
+                        default_fmi_ex = GetPropValue<int>(dm, "DefaultFmiEx"),
+                        set_condition = GetPropValue<string>(dm, "SetCondition") ?? "",
+                        release_condition = GetPropValue<string>(dm, "ReleaseCondition") ?? "",
+                        group_name = GetPropValue<string>(dm, "GroupName") ?? "",
+                        description = GetPropValue<string>(dm, "Description") ?? "",
+                        source = setName,
+                    });
+                }
+            }
+        }
+
+        // Read TDetectionMethod objects from Repo.DetectionMethod for GUID mapping
+        var dmList = GetProp(repo, "DetectionMethod") as IList;
+        if (dmList != null)
+        {
+            foreach (var dm in dmList)
+            {
+                if (dm == null || dm is string) continue;
+                var name = GetPropValue<string>(dm, "Name") ?? "";
+                var guid = GetPropValue<string>(dm, "ObjectId") ?? GetPropValue<string>(dm, "GUID") ?? "";
+                if (string.IsNullOrEmpty(name) && string.IsNullOrEmpty(guid)) continue;
+                if (!string.IsNullOrEmpty(filter) &&
+                    name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                result.Add(new
+                {
+                    detection = name,
+                    detection_vm = "",
+                    detection_method_name = "",
+                    bit = -1,
+                    default_fmi = -1,
+                    default_fmi_ex = -1,
+                    set_condition = "",
+                    release_condition = "",
+                    group_name = "",
+                    description = "",
+                    source = "Repo",
+                    guid = guid,
+                });
+            }
+        }
+
+        return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+    }
+
+    static string ReadFmiDefinitions(ZipArchive zip)
+    {
+        var dataLayer = Deserialize(zip, "project.dat");
+        var repo = GetProp(dataLayer, "Repo");
+        if (repo == null) return "{}";
+
+        var result = new { fmis = new List<object>(), fmi_exts = new List<object>() };
+
+        var fmis = GetProp(repo, "Fmis") as IList;
+        if (fmis != null)
+        {
+            foreach (var fmi in fmis)
+            {
+                if (fmi == null || fmi is string) continue;
+                result.fmis.Add(new
+                {
+                    name = GetPropValue<string>(fmi, "Name") ?? "",
+                    value = GetPropValue<int>(fmi, "Value"),
+                    guid = GetPropValue<string>(fmi, "ObjectId") ?? GetPropValue<string>(fmi, "GUID") ?? "",
+                    description = GetPropValue<string>(fmi, "Description") ?? "",
+                });
+            }
+        }
+
+        var fmiExts = GetProp(repo, "FmiExts") as IList;
+        if (fmiExts != null)
+        {
+            foreach (var fmiEx in fmiExts)
+            {
+                if (fmiEx == null || fmiEx is string) continue;
+                result.fmi_exts.Add(new
+                {
+                    name = GetPropValue<string>(fmiEx, "Name") ?? "",
+                    value = GetPropValue<int>(fmiEx, "Value"),
+                    guid = GetPropValue<string>(fmiEx, "ObjectId") ?? GetPropValue<string>(fmiEx, "GUID") ?? "",
+                    description = GetPropValue<string>(fmiEx, "Description") ?? "",
+                });
+            }
+        }
+
+        return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+    }
+
+    static string ReadErrorTemplates(ZipArchive zip)
+    {
+        var dataLayer = Deserialize(zip, "project.dat");
+        var repo = GetProp(dataLayer, "Repo");
+        if (repo == null) return "[]";
+
+        var result = new List<object>();
+
+        // ErrorTemplates are at DetectionMethodData.Custom.ErrorTemplates
+        // and DetectionMethodData.Default.ErrorTemplates
+        var repoProject = GetProp(repo, "RepoProject");
+        var detail = repoProject != null ? GetProp(repoProject, "Detail") : null;
+        var dmData = detail != null ? GetProp(detail, "DetectionMethodData") : null;
+
+        if (dmData != null)
+        {
+            foreach (var setName in new[] { "Custom", "Default" })
+            {
+                var templateSet = GetProp(dmData, setName);
+                if (templateSet == null) continue;
+                var templates = GetProp(templateSet, "ErrorTemplates") as IList;
+                if (templates == null || templates.Count == 0) continue;
+
+                foreach (var tmpl in templates)
+                {
+                    if (tmpl == null || tmpl is string) continue;
+                    result.Add(new
+                    {
+                        type = GetPropValue<string>(tmpl, "Type") ?? "",
+                        name = GetPropValue<string>(tmpl, "Name") ?? "",
+                        guid = GetPropValue<string>(tmpl, "ObjectId") ?? GetPropValue<string>(tmpl, "GUID") ?? "",
+                        description = GetPropValue<string>(tmpl, "Description") ?? "",
+                        source = setName,
+                    });
+                }
+            }
         }
 
         return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });

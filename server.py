@@ -15,6 +15,9 @@ from mcp.server.fastmcp import FastMCP
 from parser import (
     HDB_PATH, PDT_DIR,
     get_cache, clear_cache, get_errors,
+    get_detection_methods as _get_detection_methods,
+    get_fmi_definitions as _get_fmi_definitions,
+    get_error_templates as _get_error_templates,
     read_xml_from_hdb, write_xml_to_hdb,
     list_db_variables as _list_db_variables,
     get_db_variable as _get_db_variable,
@@ -636,6 +639,117 @@ def get_error(spn: int) -> str:
                  f" {e['release_debounce_ms']}ms  threshold={e['release_threshold']}")
     lines.append(f"  Reaction: advanced_info={e['reaction_advanced_info']}")
     lines.append(f"  Error Info Page: {e['error_info_page']}")
+
+    # GUID references
+    if e.get("detection_method"):
+        lines.append(f"  DetectionMethod: {e['detection_method']}")
+    if e.get("fmi"):
+        lines.append(f"  Fmi: {e['fmi']}")
+    if e.get("fmi_extended"):
+        lines.append(f"  FmiExtended: {e['fmi_extended']}")
+    if e.get("owner_id"):
+        lines.append(f"  OwnerId: {e['owner_id']}")
+    if e.get("restricted_mode"):
+        lines.append(f"  RestrictedMode: {e['restricted_mode']}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_detection_methods(filter: str = "") -> str:
+    """List custom detection methods from the PDT project.
+
+    Shows detection method names, bit positions, and default FMI values.
+    Use to resolve DetectionMethod GUIDs from error definitions.
+    Requires PDT_DIR environment variable.
+
+    Args:
+        filter: Optional name substring filter (case-insensitive).
+    """
+    try:
+        dms = _get_detection_methods(filter)
+    except Exception as e:
+        return f"Error loading detection methods: {e}"
+
+    if not dms:
+        return "No detection methods found."
+
+    # Separate by source
+    custom = [d for d in dms if d.get("source") == "Custom"]
+    repo = [d for d in dms if d.get("source") == "Repo"]
+
+    lines = []
+    if custom:
+        lines.append(f"**Custom Detection Methods ({len(custom)})**\n")
+        for d in custom:
+            lines.append(
+                f"  {d['detection']:<40s}  bit={d['bit']}  "
+                f"fmi={d['default_fmi']}  fmiEx={d['default_fmi_ex']}  "
+                f"({d['detection_method_name']})"
+            )
+
+    if repo:
+        lines.append(f"\n**Repo Detection Methods ({len(repo)})**\n")
+        for d in repo:
+            guid = d.get("guid", "")
+            lines.append(f"  {d['detection']:<40s}  GUID={guid}")
+
+    return "\n".join(lines) if lines else "No detection methods found."
+
+
+@mcp.tool()
+def list_fmi_definitions() -> str:
+    """List FMI and FMI extension (component) definitions.
+
+    Shows the GUID-to-name mapping for FMI codes and FMI extensions.
+    Use to resolve Fmi and FmiExtended GUIDs from error definitions.
+    Requires PDT_DIR environment variable.
+    """
+    try:
+        data = _get_fmi_definitions()
+    except Exception as e:
+        return f"Error loading FMI definitions: {e}"
+
+    lines = []
+    fmis = data.get("fmis", [])
+    if fmis:
+        lines.append(f"**FMI Definitions ({len(fmis)})**\n")
+        for f in fmis:
+            lines.append(f"  {f['name']:<45s}  val={f['value']}  GUID={f['guid']}")
+            if f.get("description"):
+                lines.append(f"    {f['description']}")
+
+    fmi_exts = data.get("fmi_exts", [])
+    if fmi_exts:
+        lines.append(f"\n**FMI Extensions / Components ({len(fmi_exts)})**\n")
+        for f in fmi_exts:
+            lines.append(f"  {f['name']:<45s}  val={f['value']}  GUID={f['guid']}")
+            if f.get("description"):
+                lines.append(f"    {f['description']}")
+
+    return "\n".join(lines) if lines else "No FMI definitions found."
+
+
+@mcp.tool()
+def list_error_templates() -> str:
+    """List error templates from the PDT project.
+
+    Shows custom error block templates (e.g. 'Error index radar').
+    Requires PDT_DIR environment variable.
+    """
+    try:
+        templates = _get_error_templates()
+    except Exception as e:
+        return f"Error loading error templates: {e}"
+
+    if not templates:
+        return "No error templates found."
+
+    lines = [f"**Error Templates ({len(templates)})**\n"]
+    for t in templates:
+        lines.append(f"  {t['type']:<30s}  source={t['source']}")
+        if t.get("description"):
+            lines.append(f"    {t['description']}")
 
     return "\n".join(lines)
 

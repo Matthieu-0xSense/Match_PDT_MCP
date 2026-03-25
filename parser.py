@@ -192,6 +192,7 @@ def _load_hdb() -> dict:
 
     # --- Discover data_type_id from first signal ---
     data_type_id = ""
+    ecu_data_type_id = ""
     root_sig = _read_xml(zf, "CanSignals.xml")
     if root_sig is not None:
         for sig_el in root_sig:
@@ -201,6 +202,16 @@ def _load_hdb() -> dict:
                 if dt:
                     data_type_id = dt
                     break
+        # Discover EcuApplicationLayer DataTypeId (may differ from wire type)
+        for sig_el in root_sig:
+            eal = sig_el.find("EcuApplicationLayer")
+            if eal is not None:
+                edt = _text(eal, "DataTypeId")
+                if edt and edt != data_type_id:
+                    ecu_data_type_id = edt
+                    break
+        if not ecu_data_type_id:
+            ecu_data_type_id = data_type_id
 
     # --- Databases ---
     databases: list[dict] = []
@@ -300,6 +311,7 @@ def _load_hdb() -> dict:
         "signals_by_name": signals_by_name,
         "buses": buses_list,
         "data_type_id": data_type_id,
+        "ecu_data_type_id": ecu_data_type_id,
         "databases": databases,
         "ecu_apps": ecu_apps,
         "protocols": protocols,

@@ -873,8 +873,17 @@ def _build_ecu_link_element(msg_guid, direction, ecu_id, send_buffer, recv_buffe
     return link
 
 
-def _build_signal_element(msg_guid, name, start_bit, size_bits, data_type_id):
-    """Build a complete CanSignalDataObject with all required sub-elements."""
+def _build_signal_element(msg_guid, name, start_bit, size_bits, data_type_id,
+                          ecu_data_type_id=None):
+    """Build a complete CanSignalDataObject with all required sub-elements.
+
+    Args:
+        ecu_data_type_id: DataTypeId for EcuApplicationLayer and
+            ServiceToolDefinitionLayer.  Falls back to data_type_id when not
+            provided, which keeps backward-compatible behaviour.
+    """
+    ecu_dt = ecu_data_type_id or data_type_id
+
     sig = ET.Element("CanSignalDataObject")
     _sub(sig, "Id", str(uuid.uuid4()))
     _sub(sig, "OwnerId", msg_guid)
@@ -899,7 +908,7 @@ def _build_signal_element(msg_guid, name, start_bit, size_bits, data_type_id):
 
     # EcuApplicationLayer — all fields required by PDT
     eal = _sub(sig, "EcuApplicationLayer")
-    _sub(eal, "DataTypeId", data_type_id)
+    _sub(eal, "DataTypeId", ecu_dt)
     _sub(eal, "ScalingUnit", "[-]")
     _sub(eal, "ScalingOffset", "0")
     _sub(eal, "ScalingMultiplier", "1")
@@ -911,7 +920,7 @@ def _build_signal_element(msg_guid, name, start_bit, size_bits, data_type_id):
 
     # ServiceToolDefinitionLayer
     stl = _sub(sig, "ServiceToolDefinitionLayer")
-    _sub(stl, "DataTypeId", data_type_id)
+    _sub(stl, "DataTypeId", ecu_dt)
     _sub(stl, "ScalingUnit", "[-]")
     _sub(stl, "ScalingOffset", "0")
     _sub(stl, "ScalingMultiplier", "1")
@@ -965,6 +974,7 @@ def add_can_message(
     dt_id = data.get("data_type_id", "")
     if not dt_id:
         return "Cannot determine DataTypeId — no existing signals found in the project."
+    ecu_dt_id = data.get("ecu_data_type_id", dt_id)
 
     # Parse signals
     sig_defs = []
@@ -1022,7 +1032,7 @@ def add_can_message(
             return f"Error reading CanSignals.xml: {e}"
 
         for sig_name, start_bit, size_bits in sig_defs:
-            sig_el = _build_signal_element(msg_guid, sig_name, start_bit, size_bits, dt_id)
+            sig_el = _build_signal_element(msg_guid, sig_name, start_bit, size_bits, dt_id, ecu_dt_id)
             sig_root.append(sig_el)
 
         try:

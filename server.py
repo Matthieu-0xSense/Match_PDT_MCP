@@ -924,6 +924,74 @@ def list_can_buses() -> str:
 
 
 # ---------------------------------------------------------------------------
+# MCP Tools — Add CAN Signal to existing message
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def add_can_signal(
+    message: str,
+    name: str,
+    start_bit: int,
+    size_bits: int,
+    unit: str = "[-]",
+    description: str = "new signal",
+) -> str:
+    """Add a new CAN signal to an existing message.
+
+    Args:
+        message: Name of the existing message (case-insensitive).
+        name: Signal name (e.g. 'hIndexSetpoint').
+        start_bit: Start bit position in the message.
+        size_bits: Signal width in bits.
+        unit: Engineering unit (default '[-]').
+        description: Signal description.
+    """
+    data = get_cache()
+    msg_data = data["messages_by_name"].get(message.lower())
+    if not msg_data:
+        return f"Message '{message}' not found."
+
+    msg_guid = msg_data["guid"]
+    dt_id = data.get("data_type_id", "")
+    ecu_dt_id = data.get("ecu_data_type_id", dt_id)
+    if not dt_id:
+        return "Cannot determine DataTypeId — no existing signals found."
+
+    sig_el = _build_signal_element(msg_guid, name, str(start_bit), str(size_bits),
+                                   dt_id, ecu_dt_id)
+    # Set unit in all layers
+    sdl = sig_el.find("SignalDefinitionLayer")
+    if sdl is not None:
+        u = sdl.find("Unit")
+        if u is not None:
+            u.text = unit
+        d = sdl.find("Description")
+        if d is not None:
+            d.text = description
+    for layer in ("EcuApplicationLayer", "ServiceToolDefinitionLayer"):
+        lyr = sig_el.find(layer)
+        if lyr is not None:
+            su = lyr.find("ScalingUnit")
+            if su is not None:
+                su.text = unit
+
+    try:
+        sig_root = read_xml_from_hdb("CanSignals.xml")
+    except Exception as e:
+        return f"Error reading CanSignals.xml: {e}"
+
+    sig_root.append(sig_el)
+
+    try:
+        write_xml_to_hdb("CanSignals.xml", sig_root)
+    except Exception as e:
+        return f"Error writing CanSignals.xml: {e}"
+
+    clear_cache()
+    return f"OK — Added signal '{name}' (bits [{start_bit}:{start_bit + size_bits - 1}], {unit}) to {message}."
+
+
+# ---------------------------------------------------------------------------
 # MCP Tools — Add CAN Message (high-level)
 # ---------------------------------------------------------------------------
 

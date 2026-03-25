@@ -247,3 +247,11 @@ Compares all XML files (element-level by ID/Name) and all .dat files (JSON deep-
 **Optional (for .dat file tools and diff):**
 - .NET SDK 8.0+ (to build the helper)
 - HYDAC PDT installation (provides the .NET assemblies for deserialization)
+
+## Disclaimers
+
+This project is not associated with or endorsed by HYDAC International GmbH in any way.
+
+This software was not created to compete with the HYDAC Project Definition Tool (PDT) or any other commercial software. It is a utility to help developers working with MATCH controllers interact with their project files programmatically.
+
+HYDAC PDT installation is required for .dat file functionality — this project does not include or redistribute any HYDAC proprietary files.

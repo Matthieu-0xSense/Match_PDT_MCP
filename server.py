@@ -24,6 +24,7 @@ from parser import (
     add_db_variable as _add_db_variable,
     update_db_variable as _update_db_variable,
     delete_db_variable as _delete_db_variable,
+    add_custom_error as _add_custom_error,
 )
 from formatters import fmt_can_id, fmt_message, fmt_signal
 
@@ -653,6 +654,72 @@ def get_error(spn: int) -> str:
         lines.append(f"  RestrictedMode: {e['restricted_mode']}")
 
     return "\n".join(lines)
+
+
+@mcp.tool()
+def add_custom_error(
+    template: str,
+    dm_name: str,
+    bit: int,
+    spn: int,
+    block_name: str = "",
+    description: str = "",
+    severity: int = 3,
+    fmi: str = "FMI_31_CONDITION_EXISTS",
+    fmi_extended: str = "FMIEX_GLOBAL",
+    set_debounce_ms: int = 500,
+    release_debounce_ms: int = 0,
+    set_threshold: int = 500,
+    release_threshold: int = 1000,
+) -> str:
+    """Add a custom error to the HDB project (atomic: updates both project.dat and Errors.dat).
+
+    Creates a detection method in the template and a matching error entry.
+    If the template doesn't exist, a new error block is created.
+    Backup created before first write.
+
+    Args:
+        template: Error template/block name (e.g. 'Error index us'). Creates new block if not found.
+        dm_name: Detection method name (e.g. 'DM_US_HINDEX_EOB_NEW'). Must be unique.
+        bit: Bit position within the block (0-7).
+        spn: SPN number for the error. Must be unique.
+        block_name: Software error block name (e.g. 'ERR_INDEX_US'). UPPER_SNAKE_CASE, no spaces. Required when creating a new template. Used to create the TBlock in Ecu.TBlocks for code generation.
+        description: Error description text.
+        severity: Severity level (1=info, 3=warning, 5=critical). Default 3.
+        fmi: FMI name (e.g. 'FMI_31_CONDITION_EXISTS'). Default FMI_31.
+        fmi_extended: FMI extension/component name (e.g. 'FMIEX_GLOBAL'). Default FMIEX_GLOBAL.
+        set_debounce_ms: Error set debounce time in ms. Default 500.
+        release_debounce_ms: Error release debounce time in ms. Default 0.
+        set_threshold: Error set threshold. Default 500.
+        release_threshold: Error release threshold. Default 1000.
+    """
+    try:
+        result = _add_custom_error(
+            template, dm_name, bit, spn,
+            block_name=block_name,
+            description=description, severity=severity,
+            fmi=fmi, fmi_extended=fmi_extended,
+            set_debounce_ms=set_debounce_ms,
+            release_debounce_ms=release_debounce_ms,
+            set_threshold=set_threshold,
+            release_threshold=release_threshold,
+        )
+    except Exception as e:
+        return f"Error: {e}"
+
+    if result.get("status") == "ok":
+        lines = [
+            f"OK — {result.get('message', '')}",
+            f"  SPN: {result.get('spn')}",
+            f"  DM: {result.get('dm_name')} (GUID: {result.get('dm_guid', '')})",
+            f"  Template: {result.get('template')}",
+            f"  TBlock: {result.get('block_name', '') or '(not set)'}",
+            f"  Error ObjectId: {result.get('object_id', '')}",
+            f"  New block: {result.get('new_block', False)}",
+            "Cache cleared.",
+        ]
+        return "\n".join(lines)
+    return f"Unexpected result: {result}"
 
 
 @mcp.tool()

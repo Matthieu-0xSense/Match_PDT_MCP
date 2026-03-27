@@ -420,6 +420,34 @@ def get_error_templates() -> list[dict]:
     return _run_dotnet_helper("err-list-templates", timeout=60)
 
 
+def add_custom_error(template: str, dm_name: str, bit: int, spn: int,
+                     block_name: str = "",
+                     description: str = "", severity: int = 3,
+                     fmi: str = "FMI_31_CONDITION_EXISTS",
+                     fmi_extended: str = "FMIEX_GLOBAL",
+                     set_debounce_ms: int = 500, release_debounce_ms: int = 0,
+                     set_threshold: int = 500, release_threshold: int = 1000) -> dict:
+    """Add a custom error (atomic: updates both project.dat and Errors.dat)."""
+    payload = json.dumps({
+        "template": template,
+        "dm_name": dm_name,
+        "bit": bit,
+        "spn": spn,
+        "block_name": block_name,
+        "description": description,
+        "severity": severity,
+        "fmi": fmi,
+        "fmi_extended": fmi_extended,
+        "set_debounce_ms": set_debounce_ms,
+        "release_debounce_ms": release_debounce_ms,
+        "set_threshold": set_threshold,
+        "release_threshold": release_threshold,
+    })
+    result = _run_dotnet_helper("err-custom-add", timeout=60, stdin_data=payload)
+    clear_cache()
+    return result
+
+
 # ---------------------------------------------------------------------------
 # DB variable queries & mutations
 # ---------------------------------------------------------------------------

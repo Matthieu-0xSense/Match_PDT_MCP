@@ -28,20 +28,69 @@ if not HDB_PATH:
     if _hdb_files:
         HDB_PATH = os.path.abspath(_hdb_files[0])
 
-# PDT_DIR: env var > auto-detect from standard install path
+# PDT version auto-discovery
+_PDT_BASE = r"C:\Program Files\Hydac\Project Definition Tool"
+
+
+def _version_key(v):
+    """Sort key for semantic version directory names like '2.12.100'."""
+    try:
+        return tuple(int(p) for p in v.split("."))
+    except ValueError:
+        return (0,)
+
+
+# Default PDT_DIR: env var > latest installed version (fallback)
 PDT_DIR = os.environ.get("PDT_DIR", "")
 if not PDT_DIR:
-    _pdt_base = r"C:\Program Files\Hydac\Project Definition Tool"
-    if os.path.isdir(_pdt_base):
-        # Sort by semantic version (split on dots, compare as integers)
-        def _version_key(v):
-            try:
-                return tuple(int(p) for p in v.split("."))
-            except ValueError:
-                return (0,)
-        _versions = sorted(os.listdir(_pdt_base), key=_version_key, reverse=True)
+    if os.path.isdir(_PDT_BASE):
+        _versions = sorted(os.listdir(_PDT_BASE), key=_version_key, reverse=True)
         if _versions:
-            PDT_DIR = os.path.join(_pdt_base, _versions[0])
+            PDT_DIR = os.path.join(_PDT_BASE, _versions[0])
+
+_pdt_dir_cache: dict[str, str] = {}
+
+
+def _extract_pdt_version(hdb_path: str) -> str:
+    """Read the PdtVersionString from info.xml inside the .hdb archive."""
+    try:
+        with zipfile.ZipFile(hdb_path, "r") as zf:
+            root = _read_xml(zf, "info.xml")
+            if root is not None:
+                el = root.find("PdtVersionString")
+                if el is not None and el.text:
+                    return el.text.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _resolve_pdt_dir(hdb_path: str) -> str:
+    """Resolve the best PDT installation directory for a given .hdb project.
+
+    Reads the project's PdtVersionString (e.g. '2.12.100.25'), truncates to
+    the directory format ('2.12.100'), and checks if that version is installed.
+    Falls back to the default (latest) PDT_DIR if not found.
+    """
+    if hdb_path in _pdt_dir_cache:
+        return _pdt_dir_cache[hdb_path]
+
+    version = _extract_pdt_version(hdb_path)
+    if version and os.path.isdir(_PDT_BASE):
+        # "2.12.100.25" -> "2.12.100"
+        parts = version.split(".")
+        dir_version = ".".join(parts[:3])
+        candidate = os.path.join(_PDT_BASE, dir_version)
+        if os.path.isdir(candidate):
+            _pdt_dir_cache[hdb_path] = candidate
+            return candidate
+        else:
+            import sys
+            print(f"[Match_PDT_MCP] Warning: PDT {dir_version} not installed, "
+                  f"using {PDT_DIR}", file=sys.stderr)
+
+    _pdt_dir_cache[hdb_path] = PDT_DIR
+    return PDT_DIR
 
 DOTNET_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dotnet-helper")
 
@@ -339,6 +388,7 @@ def get_cache() -> dict:
 def clear_cache() -> None:
     """Clear the cache so the next access re-parses the HDB."""
     _cache.clear()
+    _pdt_dir_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -356,16 +406,18 @@ def _run_dotnet_helper(command: str, timeout: int = 30, stdin_data: str = None) 
         timeout: Timeout in seconds.
         stdin_data: Optional JSON string to pass via stdin (for write commands).
     """
-    if not PDT_DIR:
-        raise RuntimeError("PDT_DIR environment variable not set. Point it to the PDT installation directory.")
     if not HDB_PATH:
         raise RuntimeError("HDB_PATH environment variable not set.")
 
+    pdt_dir = _resolve_pdt_dir(HDB_PATH)
+    if not pdt_dir:
+        raise RuntimeError("No PDT installation found. Set PDT_DIR or install PDT.")
+
     exe = _DOTNET_HELPER_EXE
     if os.path.exists(exe):
-        cmd = [exe, HDB_PATH, PDT_DIR] + command.split()
+        cmd = [exe, HDB_PATH, pdt_dir] + command.split()
     else:
-        cmd = ["dotnet", "run", "-c", "Release", "--", HDB_PATH, PDT_DIR] + command.split()
+        cmd = ["dotnet", "run", "-c", "Release", "--", HDB_PATH, pdt_dir] + command.split()
 
     result = subprocess.run(
         cmd,
@@ -420,6 +472,43 @@ def get_error_templates() -> list[dict]:
     return _run_dotnet_helper("err-list-templates", timeout=60)
 
 
+def _find_reference_hdb_with_err_block() -> str:
+    """Find a sibling .hdb project that has an ERR-type TBlock (for cloning).
+
+    Scans the parent directory of the current project for other .hdb files
+    and checks if they contain ERR blocks by searching for the ERR blueprint GUID.
+    """
+    if not HDB_PATH:
+        return ""
+    projects_dir = os.path.dirname(os.path.dirname(HDB_PATH))  # up from project dir
+    if not os.path.isdir(projects_dir):
+        projects_dir = os.path.dirname(HDB_PATH)
+    import uuid
+    err_blueprint = uuid.UUID("65e013fd-1bb0-4c28-ac30-7b8d5e51effd").bytes_le
+    # Scan immediate subdirectories of the projects folder
+    try:
+        for entry in os.scandir(projects_dir):
+            if not entry.is_dir():
+                continue
+            for f in os.listdir(entry.path):
+                if not f.endswith(".hdb"):
+                    continue
+                hdb = os.path.join(entry.path, f)
+                if os.path.abspath(hdb) == os.path.abspath(HDB_PATH):
+                    continue
+                try:
+                    with zipfile.ZipFile(hdb, "r") as zf:
+                        if "project.dat" in zf.namelist():
+                            raw = zf.read("project.dat")
+                            if err_blueprint in raw:
+                                return hdb
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return ""
+
+
 def add_custom_error(template: str, dm_name: str, bit: int, spn: int,
                      block_name: str = "",
                      description: str = "", severity: int = 3,
@@ -428,6 +517,8 @@ def add_custom_error(template: str, dm_name: str, bit: int, spn: int,
                      set_debounce_ms: int = 500, release_debounce_ms: int = 0,
                      set_threshold: int = 500, release_threshold: int = 1000) -> dict:
     """Add a custom error (atomic: updates both project.dat and Errors.dat)."""
+    # Find a reference project with ERR blocks for cloning if needed
+    ref_hdb = _find_reference_hdb_with_err_block()
     payload = json.dumps({
         "template": template,
         "dm_name": dm_name,
@@ -442,6 +533,7 @@ def add_custom_error(template: str, dm_name: str, bit: int, spn: int,
         "release_debounce_ms": release_debounce_ms,
         "set_threshold": set_threshold,
         "release_threshold": release_threshold,
+        "ref_hdb": ref_hdb,
     })
     result = _run_dotnet_helper("err-custom-add", timeout=60, stdin_data=payload)
     clear_cache()

@@ -1342,6 +1342,7 @@ class Program
         int releaseDebounceMs = payload.TryGetProperty("release_debounce_ms", out var rdm) ? rdm.GetInt32() : 0;
         int setThreshold = payload.TryGetProperty("set_threshold", out var st) ? st.GetInt32() : 500;
         int releaseThreshold = payload.TryGetProperty("release_threshold", out var rt) ? rt.GetInt32() : 1000;
+        string refHdb = payload.TryGetProperty("ref_hdb", out var rh) ? (rh.GetString() ?? "") : "";
 
         if (string.IsNullOrEmpty(template)) throw new ArgumentException("'template' is required");
         if (string.IsNullOrEmpty(dmName)) throw new ArgumentException("'dm_name' is required");
@@ -1418,34 +1419,51 @@ class Program
                 }
             }
 
-            // Find source ERR TBlock index (needed for both new and existing template paths)
+            // Find source ERR TBlock index (needed for TBlock cloning).
+            // Only use a real ERR-type block with a valid blueprint — using a non-ERR
+            // block or one without a blueprint creates TBlocks that PDT can't resolve.
             for (int i = 0; i < tblocks.Count; i++)
             {
                 if (tblocks[i] == null || tblocks[i] is string) continue;
                 if ((GetPropValue<string>(tblocks[i], "Type") ?? "") == "ERR")
                 {
-                    sourceBlockIdx = i;
-                    break;
+                    var bp = GetPropValue<string>(tblocks[i], "GUIDBlueprint") ?? "";
+                    if (!string.IsNullOrEmpty(bp) && bp != "00000000-0000-0000-0000-000000000000")
+                    {
+                        sourceBlockIdx = i;
+                        break;
+                    }
                 }
             }
 
             // --- Create new template if not found ---
             if (targetTemplate == null)
             {
-                if (sourceTemplateIdx < 0)
-                    throw new InvalidOperationException("No existing error templates to clone from.");
                 if (string.IsNullOrEmpty(blockName))
                     throw new ArgumentException("'block_name' is required when creating a new template.");
 
-                // Clone template (stays in live graph)
-                var srcTemplate = customTemplates[sourceTemplateIdx];
-                try { targetTemplate = Activator.CreateInstance(srcTemplate.GetType()); }
-                catch { targetTemplate = System.Runtime.Serialization.FormatterServices.GetUninitializedObject(srcTemplate.GetType()); }
-                foreach (var prop in srcTemplate.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                bool hasSource = sourceTemplateIdx >= 0;
+                object srcTemplate = hasSource ? customTemplates[sourceTemplateIdx] : null;
+
+                // Resolve the TErrorTemplate type: from source object or from the collection's generic type
+                Type templateType;
+                if (hasSource)
+                    templateType = srcTemplate.GetType();
+                else
+                    templateType = customTemplates.GetType().GetGenericArguments()[0];
+
+                try { targetTemplate = Activator.CreateInstance(templateType); }
+                catch { targetTemplate = System.Runtime.Serialization.FormatterServices.GetUninitializedObject(templateType); }
+
+                // Copy properties from source if available
+                if (hasSource)
                 {
-                    if (!prop.CanRead || !prop.CanWrite || prop.GetIndexParameters().Length > 0) continue;
-                    if (prop.Name == "Error" || prop.Name == "LinkedBlockIds" || prop.Name == "LinkedBlocks") continue;
-                    try { prop.SetValue(targetTemplate, prop.GetValue(srcTemplate)); } catch { }
+                    foreach (var prop in templateType.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                    {
+                        if (!prop.CanRead || !prop.CanWrite || prop.GetIndexParameters().Length > 0) continue;
+                        if (prop.Name == "Error" || prop.Name == "LinkedBlockIds" || prop.Name == "LinkedBlocks") continue;
+                        try { prop.SetValue(targetTemplate, prop.GetValue(srcTemplate)); } catch { }
+                    }
                 }
 
                 string tmplGuid = Guid.NewGuid().ToString();
@@ -1457,45 +1475,105 @@ class Program
                 try { SetProp(targetTemplate, "PinType", "DEFAULT"); } catch { }
 
                 // Create empty LinkedBlockIds list (populated after TBlock creation)
-                var srcLinkedIds = GetProp(srcTemplate, "LinkedBlockIds") as IList;
-                if (srcLinkedIds != null)
+                if (hasSource)
                 {
-                    var newLinkedIds = (IList)Activator.CreateInstance(srcLinkedIds.GetType());
+                    var srcLinkedIds = GetProp(srcTemplate, "LinkedBlockIds") as IList;
+                    if (srcLinkedIds != null)
+                    {
+                        var newLinkedIds = (IList)Activator.CreateInstance(srcLinkedIds.GetType());
+                        try { SetProp(targetTemplate, "LinkedBlockIds", newLinkedIds); } catch { }
+                    }
+                }
+                else
+                {
+                    // No source: create ObservableCollection<Guid> for LinkedBlockIds
+                    var linkedIdsType = typeof(System.Collections.ObjectModel.ObservableCollection<>).MakeGenericType(typeof(Guid));
+                    var newLinkedIds = (IList)Activator.CreateInstance(linkedIdsType);
                     try { SetProp(targetTemplate, "LinkedBlockIds", newLinkedIds); } catch { }
                 }
 
                 // Create ONLY 1 DM template entry (for the active bit) — matching PDT behavior
-                var srcError = GetProp(srcTemplate, "Error") as IList;
-                if (srcError != null)
-                {
-                    var newErrorList = (IList)Activator.CreateInstance(srcError.GetType());
-                    try { SetProp(targetTemplate, "Error", newErrorList); } catch { }
+                // The template's Error list uses TDetectionMethodErrorBase elements,
+                // while customDMs uses TDetectionMethodTemplate elements — different types.
+                // We need to create objects of the correct type for each collection.
 
-                    // Find source DM template at bit 0 as template for structure
-                    object srcDmTmpl0 = null;
-                    foreach (var dm in srcError)
+                // Resolve types from the property declarations (works even with empty collections)
+                Type dmErrorBaseType = null;   // for template.Error list
+                Type dmTemplateType = null;     // for customDMs list
+
+                var errorPropType = targetTemplate.GetType().GetProperty("Error")?.PropertyType;
+                if (errorPropType?.IsGenericType == true)
+                    dmErrorBaseType = errorPropType.GetGenericArguments()[0];
+
+                dmTemplateType = customDMs.GetType().GetGenericArguments()[0];
+
+                // Get source items if available
+                IList srcError = hasSource ? GetProp(srcTemplate, "Error") as IList : null;
+
+                // Create the Error list with the correct element type
+                if (dmErrorBaseType != null)
+                {
+                    IList newErrorList;
+                    if (srcError != null)
+                        newErrorList = (IList)Activator.CreateInstance(srcError.GetType());
+                    else
+                        newErrorList = (IList)Activator.CreateInstance(errorPropType);
+                    SetProp(targetTemplate, "Error", newErrorList);
+
+                    // Create a TDetectionMethodErrorBase for the template's Error list
+                    object newDmError;
+                    try { newDmError = Activator.CreateInstance(dmErrorBaseType); }
+                    catch { newDmError = System.Runtime.Serialization.FormatterServices.GetUninitializedObject(dmErrorBaseType); }
+
+                    // Copy properties from source DM if available
+                    object srcDmError = null;
+                    if (srcError != null)
                     {
-                        if (dm != null && !(dm is string)) { srcDmTmpl0 = dm; break; }
+                        foreach (var dm in srcError)
+                        {
+                            if (dm != null && !(dm is string)) { srcDmError = dm; break; }
+                        }
                     }
-                    if (srcDmTmpl0 != null)
+                    if (srcDmError != null)
                     {
-                        var newDmTmpl = Activator.CreateInstance(srcDmTmpl0.GetType());
-                        foreach (var prop in srcDmTmpl0.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                        foreach (var prop in dmErrorBaseType.GetProperties(BindingFlags.Public | BindingFlags.Instance))
                         {
                             if (!prop.CanRead || !prop.CanWrite || prop.GetIndexParameters().Length > 0) continue;
-                            try { prop.SetValue(newDmTmpl, prop.GetValue(srcDmTmpl0)); } catch { }
+                            try { prop.SetValue(newDmError, prop.GetValue(srcDmError)); } catch { }
                         }
-                        SetProp(newDmTmpl, "Bit", bit);
-                        SetProp(newDmTmpl, "DetectionMethodName", $"DM_ERR_{bit:D2}");
-                        SetProp(newDmTmpl, "Detection", dmName);
-                        SetProp(newDmTmpl, "DetectionVm", dmName);
-                        try { SetProp(newDmTmpl, "Description", description); } catch { }
-                        SetProp(newDmTmpl, "DefaultFmi", defaultFmi);
-                        SetProp(newDmTmpl, "DefaultFmiEx", defaultFmiEx);
-
-                        newErrorList.Add(newDmTmpl);
-                        customDMs.Add(newDmTmpl);
                     }
+
+                    SetProp(newDmError, "Bit", bit);
+                    SetProp(newDmError, "DetectionMethodName", $"DM_ERR_{bit:D2}");
+                    try { SetProp(newDmError, "Detection", dmName); } catch { }
+                    try { SetProp(newDmError, "DetectionVm", dmName); } catch { }
+                    try { SetProp(newDmError, "Description", description); } catch { }
+                    try { SetProp(newDmError, "DefaultFmi", defaultFmi); } catch { }
+                    try { SetProp(newDmError, "DefaultFmiEx", defaultFmiEx); } catch { }
+                    try { SetProp(newDmError, "ObjectId", Guid.NewGuid().ToString()); } catch { }
+                    try { SetProp(newDmError, "GUID", Guid.NewGuid().ToString()); } catch { }
+
+                    newErrorList.Add(newDmError);
+                }
+
+                // Create a TDetectionMethodTemplate for the customDMs collection
+                if (dmTemplateType != null)
+                {
+                    object newDmTmpl;
+                    try { newDmTmpl = Activator.CreateInstance(dmTemplateType); }
+                    catch { newDmTmpl = System.Runtime.Serialization.FormatterServices.GetUninitializedObject(dmTemplateType); }
+
+                    SetProp(newDmTmpl, "Bit", bit);
+                    SetProp(newDmTmpl, "DetectionMethodName", $"DM_ERR_{bit:D2}");
+                    SetProp(newDmTmpl, "Detection", dmName);
+                    SetProp(newDmTmpl, "DetectionVm", dmName);
+                    try { SetProp(newDmTmpl, "Description", description); } catch { }
+                    SetProp(newDmTmpl, "DefaultFmi", defaultFmi);
+                    SetProp(newDmTmpl, "DefaultFmiEx", defaultFmiEx);
+                    try { SetProp(newDmTmpl, "ObjectId", Guid.NewGuid().ToString()); } catch { }
+                    try { SetProp(newDmTmpl, "GUID", Guid.NewGuid().ToString()); } catch { }
+
+                    customDMs.Add(newDmTmpl);
                 }
 
                 customTemplates.Add(targetTemplate);
@@ -1529,14 +1607,20 @@ class Program
                     if (customDMs[i] != null && !(customDMs[i] is string))
                     { sourceDm = customDMs[i]; break; }
                 }
-                if (sourceDm == null)
-                    throw new InvalidOperationException("No existing DM templates to clone from.");
 
-                var newDm = Activator.CreateInstance(sourceDm.GetType());
-                foreach (var prop in sourceDm.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                // Resolve DM type: from source object, or from collection generic arg
+                Type dmType = sourceDm?.GetType() ?? customDMs.GetType().GetGenericArguments()[0];
+                object newDm;
+                try { newDm = Activator.CreateInstance(dmType); }
+                catch { newDm = System.Runtime.Serialization.FormatterServices.GetUninitializedObject(dmType); }
+
+                if (sourceDm != null)
                 {
-                    if (!prop.CanRead || !prop.CanWrite || prop.GetIndexParameters().Length > 0) continue;
-                    try { prop.SetValue(newDm, prop.GetValue(sourceDm)); } catch { }
+                    foreach (var prop in dmType.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                    {
+                        if (!prop.CanRead || !prop.CanWrite || prop.GetIndexParameters().Length > 0) continue;
+                        try { prop.SetValue(newDm, prop.GetValue(sourceDm)); } catch { }
+                    }
                 }
                 dmGuid = Guid.NewGuid().ToString();
                 SetProp(newDm, "Detection", dmName);
@@ -1587,9 +1671,13 @@ class Program
                 SetProp(newError, "Fmi", fmiGuid);
             if (!string.IsNullOrEmpty(fmiExtGuid))
                 SetProp(newError, "FmiExtended", fmiExtGuid);
-            // DetectionMethod GUID set later if TBlock is created
+            // DetectionMethod: use the custom DM GUID if available, otherwise generate a new one.
+            // MUST override the cloned error's DetectionMethod to avoid duplicates
+            // (two errors sharing one DM causes "Sequence contains more than one matching element").
             if (!string.IsNullOrEmpty(dmGuid))
                 SetProp(newError, "DetectionMethod", dmGuid);
+            else
+                SetProp(newError, "DetectionMethod", Guid.NewGuid().ToString());
 
             var setProps = GetProp(newError, "SetProperties");
             if (setProps != null)
@@ -1609,40 +1697,75 @@ class Program
             errors.Add(newError);
 
             // --- Create or update TBlock ---
+            // ERR block blueprint constants (shared across all MATCH versions)
+            const string ERR_BLUEPRINT_GUID = "65e013fd-1bb0-4c28-ac30-7b8d5e51effd";
+            const string ERR_BLUEPRINT_VERSION = "0.1.3.0";
+
             if (!string.IsNullOrEmpty(blockName))
             {
                 if (newTemplate)
                 {
-                    // Clone TBlock using Activator within the LIVE graph.
-                    // Deep-clone reference-type sub-objects to avoid shared references.
-                    if (sourceBlockIdx < 0)
-                        throw new InvalidOperationException("No existing ERR TBlock to clone from.");
-
-                    object sourceBlock = tblocks[sourceBlockIdx];
+                    // Clone TBlock from existing ERR source or create from scratch.
+                    bool hasSourceBlock = sourceBlockIdx >= 0;
+                    object sourceBlock = hasSourceBlock ? tblocks[sourceBlockIdx] : null;
                     string blockGuid = Guid.NewGuid().ToString();
 
-                    var newBlock = Activator.CreateInstance(sourceBlock.GetType());
-
-                    // Copy scalar-only top-level properties
-                    var skipProps = new HashSet<string> {
-                        "TEcu", "TBlockParams", "TBlockParamSections", "TDetectionMethods",
-                        "DetectionMethods", "Ports", "TPins", "TSignalElement", "TComponents",
-                        "Detail", "TSoftwareModule", "Blueprint", "BaseBlueprint", "EcuBlueprint",
-                        "Message", "UpdatingTemplate", "TBlock", "EcuCan"
-                    };
-                    foreach (var prop in sourceBlock.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                    // Resolve TBlock type: from source block or from the tblocks collection
+                    Type tblockType;
+                    if (hasSourceBlock)
+                        tblockType = sourceBlock.GetType();
+                    else
                     {
-                        if (!prop.CanRead || !prop.CanWrite || prop.GetIndexParameters().Length > 0) continue;
-                        if (skipProps.Contains(prop.Name)) continue;
-                        try { prop.SetValue(newBlock, prop.GetValue(sourceBlock)); } catch { }
+                        // Use first valid TBlock's type or the collection's generic arg
+                        tblockType = null;
+                        foreach (var tb in (IEnumerable)tblocks)
+                        {
+                            if (tb != null && !(tb is string)) { tblockType = tb.GetType(); break; }
+                        }
+                        if (tblockType == null)
+                            tblockType = tblocks.GetType().GetGenericArguments()[0];
+                    }
+
+                    object newBlock;
+                    try { newBlock = Activator.CreateInstance(tblockType); }
+                    catch { newBlock = System.Runtime.Serialization.FormatterServices.GetUninitializedObject(tblockType); }
+
+                    // Copy scalar-only top-level properties from ERR source if available
+                    if (hasSourceBlock)
+                    {
+                        var skipProps = new HashSet<string> {
+                            "TEcu", "TBlockParams", "TBlockParamSections", "TDetectionMethods",
+                            "DetectionMethods", "Ports", "TPins", "TSignalElement", "TComponents",
+                            "Detail", "TSoftwareModule", "Blueprint", "BaseBlueprint", "EcuBlueprint",
+                            "Message", "UpdatingTemplate", "TBlock", "EcuCan",
+                            // Version-specific properties: copying these from the source block
+                            // would tie the new block to the source's plugin version, causing
+                            // "Plugin with Block ERR x.x.x.x could not be found" errors in PDT.
+                            "RevisionSoftware", "MatchVersion", "TRevisionSoftware", "SoftwareVersion",
+                            "Version", "PluginVersion"
+                        };
+                        foreach (var prop in tblockType.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                        {
+                            if (!prop.CanRead || !prop.CanWrite || prop.GetIndexParameters().Length > 0) continue;
+                            if (skipProps.Contains(prop.Name)) continue;
+                            try { prop.SetValue(newBlock, prop.GetValue(sourceBlock)); } catch { }
+                        }
                     }
 
                     SetProp(newBlock, "Name", blockName);
                     SetProp(newBlock, "Key", $"[ERR].[{blockName}]");
+                    SetProp(newBlock, "Type", "ERR");
                     SetProp(newBlock, "ObjectId", blockGuid);
                     try { SetProp(newBlock, "GUID", blockGuid); } catch { }
                     try { SetProp(newBlock, "TEcu", ecu); } catch { }
-                    try { SetProp(newBlock, "GUIDBlueprint", "00000000-0000-0000-0000-000000000000"); } catch { }
+                    // ERR block blueprint and version — required for PDT to resolve the block plugin
+                    try { SetProp(newBlock, "GUIDBlueprint", ERR_BLUEPRINT_GUID); } catch { }
+                    try { SetProp(newBlock, "Version", ERR_BLUEPRINT_VERSION); } catch { }
+                    try { SetProp(newBlock, "BlueprintClassName", "ERR"); } catch { }
+                    try { SetProp(newBlock, "BlueprintLibName", "Standard"); } catch { }
+                    try { SetProp(newBlock, "Description", "ERR - Common Error Interface"); } catch { }
+                    try { SetProp(newBlock, "Category", "CAT_NONE"); } catch { }
+                    try { SetProp(newBlock, "Behaviour", "OBJ_RELEASE"); } catch { }
 
                     // TBlock.Detail: shared (Activator nonPublic ctor causes serialization issues)
 
@@ -1803,119 +1926,265 @@ class Program
                     }
                     // --- END DIAGNOSTIC ---
 
-                    // Clone TBlockParamSections
-                    var srcSections = GetProp(sourceBlock, "TBlockParamSections") as IList;
-                    if (srcSections != null)
+                    // Clone TBlockParamSections and TDetectionMethods from source (if available)
+                    if (hasSourceBlock)
                     {
-                        var newSections = (IList)Activator.CreateInstance(srcSections.GetType());
-                        try { SetProp(newBlock, "TBlockParamSections", newSections); } catch { }
-
-                        foreach (var srcSection in srcSections)
+                        // Clone TBlockParamSections
+                        var srcSections = GetProp(sourceBlock, "TBlockParamSections") as IList;
+                        if (srcSections != null)
                         {
-                            if (srcSection == null || srcSection is string) continue;
-                            var newSection = Activator.CreateInstance(srcSection.GetType());
-                            foreach (var prop in srcSection.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
-                            {
-                                if (!prop.CanRead || !prop.CanWrite || prop.GetIndexParameters().Length > 0) continue;
-                                if (prop.Name == "TBlock" || prop.Name == "TBlockParams") continue;
-                                try { prop.SetValue(newSection, prop.GetValue(srcSection)); } catch { }
-                            }
-                            try { SetProp(newSection, "GUID", Guid.NewGuid().ToString()); } catch { }
-                            try { SetProp(newSection, "TBlock", newBlock); } catch { }
-                            // Section.Detail: shared (Detail types cause deserialization NullRef when created empty)
+                            var newSections = (IList)Activator.CreateInstance(srcSections.GetType());
+                            try { SetProp(newBlock, "TBlockParamSections", newSections); } catch { }
 
-                            // Clone TBlockParams within section
-                            var srcParams = GetProp(srcSection, "TBlockParams") as IList;
-                            if (srcParams != null)
+                            foreach (var srcSection in srcSections)
                             {
-                                var newParams = (IList)Activator.CreateInstance(srcParams.GetType());
-                                try { SetProp(newSection, "TBlockParams", newParams); } catch { }
-
-                                foreach (var srcParam in srcParams)
+                                if (srcSection == null || srcSection is string) continue;
+                                var newSection = Activator.CreateInstance(srcSection.GetType());
+                                foreach (var prop in srcSection.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
                                 {
-                                    if (srcParam == null || srcParam is string) continue;
-                                    var newParam = Activator.CreateInstance(srcParam.GetType());
-                                    foreach (var prop in srcParam.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                                    if (!prop.CanRead || !prop.CanWrite || prop.GetIndexParameters().Length > 0) continue;
+                                    if (prop.Name == "TBlock" || prop.Name == "TBlockParams") continue;
+                                    try { prop.SetValue(newSection, prop.GetValue(srcSection)); } catch { }
+                                }
+                                try { SetProp(newSection, "GUID", Guid.NewGuid().ToString()); } catch { }
+                                try { SetProp(newSection, "TBlock", newBlock); } catch { }
+                                // Section.Detail: shared (Detail types cause deserialization NullRef when created empty)
+
+                                // Clone TBlockParams within section
+                                var srcParams = GetProp(srcSection, "TBlockParams") as IList;
+                                if (srcParams != null)
+                                {
+                                    var newParams = (IList)Activator.CreateInstance(srcParams.GetType());
+                                    try { SetProp(newSection, "TBlockParams", newParams); } catch { }
+
+                                    foreach (var srcParam in srcParams)
+                                    {
+                                        if (srcParam == null || srcParam is string) continue;
+                                        var newParam = Activator.CreateInstance(srcParam.GetType());
+                                        foreach (var prop in srcParam.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                                        {
+                                            if (!prop.CanRead || !prop.CanWrite || prop.GetIndexParameters().Length > 0) continue;
+                                            if (prop.Name == "TBlock" || prop.Name == "TBlockParamSection"
+                                                || prop.Name == "ValueData" || prop.Name == "BlockParameterDetail") continue;
+                                            try { prop.SetValue(newParam, prop.GetValue(srcParam)); } catch { }
+                                        }
+                                        try { SetProp(newParam, "GUID", Guid.NewGuid().ToString()); } catch { }
+                                        try { SetProp(newParam, "TBlock", newBlock); } catch { }
+                                        try { SetProp(newParam, "TBlockParamSection", newSection); } catch { }
+
+                                        // Create independent ValueData via constructor(TBlockParam)
+                                        var srcVd = GetProp(srcParam, "ValueData");
+                                        if (srcVd != null)
+                                        {
+                                            try
+                                            {
+                                                var newVd = Activator.CreateInstance(srcVd.GetType(), new object[] { newParam });
+                                                foreach (var vp in srcVd.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                                                {
+                                                    if (!vp.CanRead || !vp.CanWrite || vp.GetIndexParameters().Length > 0) continue;
+                                                    try { vp.SetValue(newVd, vp.GetValue(srcVd)); } catch { }
+                                                }
+                                                SetProp(newParam, "ValueData", newVd);
+                                            }
+                                            catch { /* fallback: leave shared */ }
+                                        }
+
+                                                        // BlockParameterDetail: shared (empty Detail objects cause deserialization NullRef)
+
+                                        if ((GetPropValue<string>(newParam, "Name") ?? "") == "BLOCK_NAME")
+                                        {
+                                            SetProp(newParam, "ValueText", blockName);
+                                            var vd = GetProp(newParam, "ValueData");
+                                            if (vd != null) try { SetProp(vd, "Value", blockName); } catch { }
+                                        }
+
+                                        newParams.Add(newParam);
+                                    }
+                                }
+
+                                newSections.Add(newSection);
+                            }
+                        }
+
+                        // Clone TDetectionMethods
+                        var srcDMsList = GetProp(sourceBlock, "TDetectionMethods") as IList;
+                        if (srcDMsList != null)
+                        {
+                            var newDMsList = (IList)Activator.CreateInstance(srcDMsList.GetType());
+                            try { SetProp(newBlock, "TDetectionMethods", newDMsList); } catch { }
+                            try { SetProp(newBlock, "DetectionMethods", newDMsList); } catch { }
+
+                            foreach (var srcBdm in srcDMsList)
+                            {
+                                if (srcBdm == null || srcBdm is string) continue;
+                                var newBdm = Activator.CreateInstance(srcBdm.GetType());
+                                foreach (var prop in srcBdm.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                                {
+                                    if (!prop.CanRead || !prop.CanWrite || prop.GetIndexParameters().Length > 0) continue;
+                                    if (prop.Name == "TBlock" || prop.Name == "TError" || prop.Name == "Error") continue;
+                                    try { prop.SetValue(newBdm, prop.GetValue(srcBdm)); } catch { }
+                                }
+                                int bdmBit = GetPropValue<int>(newBdm, "Bit");
+                                string bdmGuid = Guid.NewGuid().ToString();
+                                try { SetProp(newBdm, "ObjectId", bdmGuid); } catch { }
+                                try { SetProp(newBdm, "GUID", bdmGuid); } catch { }
+                                SetProp(newBdm, "BlockObjectId", blockGuid);
+                                try { SetProp(newBdm, "TBlock", newBlock); } catch { }
+                                // DM.Detail: shared
+
+                                if (bdmBit == bit)
+                                    SetProp(newBdm, "CustomName", dmName);
+                                else
+                                    SetProp(newBdm, "CustomName", $"DM_ERR_{bdmBit:D2}");
+
+                                newDMsList.Add(newBdm);
+                                repoDMs.Add(newBdm);
+
+                                if (bdmBit == bit)
+                                    SetProp(newError, "DetectionMethod", bdmGuid);
+                            }
+                        }
+                    }
+                    else if (!string.IsNullOrEmpty(refHdb))
+                    {
+                        // No source ERR block in this project: clone from a reference project.
+                        // Deserialize the reference project.dat and find the first ERR block.
+                        byte[] refDatBytes;
+                        using (var refZip = ZipFile.OpenRead(refHdb))
+                        {
+                            var refEntry = refZip.GetEntry("project.dat");
+                            using var ms = new MemoryStream();
+                            refEntry.Open().CopyTo(ms);
+                            refDatBytes = ms.ToArray();
+                        }
+                        var refRoot = new BinaryFormatter().Deserialize(new MemoryStream(refDatBytes));
+                        var refRepo = GetProp(refRoot, "Repo");
+                        var refRevSofts = GetProp(refRepo, "RevisionSoftwares") as IList;
+                        var refEcu = GetProp(refRevSofts[0], "Ecu");
+                        var refBlocks = GetProp(refEcu, "TBlocks") as IList;
+
+                        object refErrBlock = null;
+                        foreach (var rb in refBlocks)
+                        {
+                            if (rb == null || rb is string) continue;
+                            if ((GetPropValue<string>(rb, "Type") ?? "") == "ERR"
+                                && !string.IsNullOrEmpty(GetPropValue<string>(rb, "Name")))
+                            {
+                                refErrBlock = rb;
+                                break;
+                            }
+                        }
+
+                        if (refErrBlock != null)
+                        {
+                            // Clone TBlockParamSections from reference ERR block
+                            var refSections = GetProp(refErrBlock, "TBlockParamSections") as IList;
+                            if (refSections != null)
+                            {
+                                var newSections = (IList)Activator.CreateInstance(refSections.GetType());
+                                try { SetProp(newBlock, "TBlockParamSections", newSections); } catch { }
+
+                                foreach (var srcSection in refSections)
+                                {
+                                    if (srcSection == null || srcSection is string) continue;
+                                    var newSection = Activator.CreateInstance(srcSection.GetType());
+                                    foreach (var prop in srcSection.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
                                     {
                                         if (!prop.CanRead || !prop.CanWrite || prop.GetIndexParameters().Length > 0) continue;
-                                        if (prop.Name == "TBlock" || prop.Name == "TBlockParamSection"
-                                            || prop.Name == "ValueData" || prop.Name == "BlockParameterDetail") continue;
-                                        try { prop.SetValue(newParam, prop.GetValue(srcParam)); } catch { }
+                                        if (prop.Name == "TBlock" || prop.Name == "TBlockParams") continue;
+                                        try { prop.SetValue(newSection, prop.GetValue(srcSection)); } catch { }
                                     }
-                                    try { SetProp(newParam, "GUID", Guid.NewGuid().ToString()); } catch { }
-                                    try { SetProp(newParam, "TBlock", newBlock); } catch { }
-                                    try { SetProp(newParam, "TBlockParamSection", newSection); } catch { }
+                                    try { SetProp(newSection, "GUID", Guid.NewGuid().ToString()); } catch { }
+                                    try { SetProp(newSection, "TBlock", newBlock); } catch { }
 
-                                    // Create independent ValueData via constructor(TBlockParam)
-                                    var srcVd = GetProp(srcParam, "ValueData");
-                                    if (srcVd != null)
+                                    var srcParams = GetProp(srcSection, "TBlockParams") as IList;
+                                    if (srcParams != null)
                                     {
-                                        try
+                                        var newParams = (IList)Activator.CreateInstance(srcParams.GetType());
+                                        try { SetProp(newSection, "TBlockParams", newParams); } catch { }
+
+                                        foreach (var srcParam in srcParams)
                                         {
-                                            var newVd = Activator.CreateInstance(srcVd.GetType(), new object[] { newParam });
-                                            foreach (var vp in srcVd.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                                            if (srcParam == null || srcParam is string) continue;
+                                            var newParam = Activator.CreateInstance(srcParam.GetType());
+                                            foreach (var prop in srcParam.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
                                             {
-                                                if (!vp.CanRead || !vp.CanWrite || vp.GetIndexParameters().Length > 0) continue;
-                                                try { vp.SetValue(newVd, vp.GetValue(srcVd)); } catch { }
+                                                if (!prop.CanRead || !prop.CanWrite || prop.GetIndexParameters().Length > 0) continue;
+                                                if (prop.Name == "TBlock" || prop.Name == "TBlockParamSection"
+                                                    || prop.Name == "ValueData" || prop.Name == "BlockParameterDetail") continue;
+                                                try { prop.SetValue(newParam, prop.GetValue(srcParam)); } catch { }
                                             }
-                                            SetProp(newParam, "ValueData", newVd);
+                                            try { SetProp(newParam, "GUID", Guid.NewGuid().ToString()); } catch { }
+                                            try { SetProp(newParam, "TBlock", newBlock); } catch { }
+                                            try { SetProp(newParam, "TBlockParamSection", newSection); } catch { }
+
+                                            var srcVd = GetProp(srcParam, "ValueData");
+                                            if (srcVd != null)
+                                            {
+                                                try
+                                                {
+                                                    var newVd = Activator.CreateInstance(srcVd.GetType(), new object[] { newParam });
+                                                    foreach (var vp in srcVd.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                                                    {
+                                                        if (!vp.CanRead || !vp.CanWrite || vp.GetIndexParameters().Length > 0) continue;
+                                                        try { vp.SetValue(newVd, vp.GetValue(srcVd)); } catch { }
+                                                    }
+                                                    SetProp(newParam, "ValueData", newVd);
+                                                }
+                                                catch { }
+                                            }
+
+                                            if ((GetPropValue<string>(newParam, "Name") ?? "") == "BLOCK_NAME")
+                                            {
+                                                SetProp(newParam, "ValueText", blockName);
+                                                var vd = GetProp(newParam, "ValueData");
+                                                if (vd != null) try { SetProp(vd, "Value", blockName); } catch { }
+                                            }
+
+                                            newParams.Add(newParam);
                                         }
-                                        catch { /* fallback: leave shared */ }
                                     }
-
-                                                    // BlockParameterDetail: shared (empty Detail objects cause deserialization NullRef)
-
-                                    if ((GetPropValue<string>(newParam, "Name") ?? "") == "BLOCK_NAME")
-                                    {
-                                        SetProp(newParam, "ValueText", blockName);
-                                        var vd = GetProp(newParam, "ValueData");
-                                        if (vd != null) try { SetProp(vd, "Value", blockName); } catch { }
-                                    }
-
-                                    newParams.Add(newParam);
+                                    newSections.Add(newSection);
                                 }
                             }
 
-                            newSections.Add(newSection);
-                        }
-                    }
-
-                    // Clone TDetectionMethods
-                    var srcDMsList = GetProp(sourceBlock, "TDetectionMethods") as IList;
-                    if (srcDMsList != null)
-                    {
-                        var newDMsList = (IList)Activator.CreateInstance(srcDMsList.GetType());
-                        try { SetProp(newBlock, "TDetectionMethods", newDMsList); } catch { }
-                        try { SetProp(newBlock, "DetectionMethods", newDMsList); } catch { }
-
-                        foreach (var srcBdm in srcDMsList)
-                        {
-                            if (srcBdm == null || srcBdm is string) continue;
-                            var newBdm = Activator.CreateInstance(srcBdm.GetType());
-                            foreach (var prop in srcBdm.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                            // Clone TDetectionMethods from reference ERR block
+                            var refDMsList = GetProp(refErrBlock, "TDetectionMethods") as IList;
+                            if (refDMsList != null)
                             {
-                                if (!prop.CanRead || !prop.CanWrite || prop.GetIndexParameters().Length > 0) continue;
-                                if (prop.Name == "TBlock" || prop.Name == "TError" || prop.Name == "Error") continue;
-                                try { prop.SetValue(newBdm, prop.GetValue(srcBdm)); } catch { }
+                                var newDMsList = (IList)Activator.CreateInstance(refDMsList.GetType());
+                                try { SetProp(newBlock, "TDetectionMethods", newDMsList); } catch { }
+                                try { SetProp(newBlock, "DetectionMethods", newDMsList); } catch { }
+
+                                foreach (var srcBdm in refDMsList)
+                                {
+                                    if (srcBdm == null || srcBdm is string) continue;
+                                    var newBdm = Activator.CreateInstance(srcBdm.GetType());
+                                    foreach (var prop in srcBdm.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                                    {
+                                        if (!prop.CanRead || !prop.CanWrite || prop.GetIndexParameters().Length > 0) continue;
+                                        if (prop.Name == "TBlock" || prop.Name == "TError" || prop.Name == "Error") continue;
+                                        try { prop.SetValue(newBdm, prop.GetValue(srcBdm)); } catch { }
+                                    }
+                                    int bdmBit = GetPropValue<int>(newBdm, "Bit");
+                                    string bdmGuid = Guid.NewGuid().ToString();
+                                    try { SetProp(newBdm, "ObjectId", bdmGuid); } catch { }
+                                    try { SetProp(newBdm, "GUID", bdmGuid); } catch { }
+                                    SetProp(newBdm, "BlockObjectId", blockGuid);
+                                    try { SetProp(newBdm, "TBlock", newBlock); } catch { }
+
+                                    if (bdmBit == bit)
+                                        SetProp(newBdm, "CustomName", dmName);
+                                    else
+                                        SetProp(newBdm, "CustomName", $"DM_ERR_{bdmBit:D2}");
+
+                                    newDMsList.Add(newBdm);
+                                    repoDMs.Add(newBdm);
+
+                                    if (bdmBit == bit)
+                                        SetProp(newError, "DetectionMethod", bdmGuid);
+                                }
                             }
-                            int bdmBit = GetPropValue<int>(newBdm, "Bit");
-                            string bdmGuid = Guid.NewGuid().ToString();
-                            try { SetProp(newBdm, "ObjectId", bdmGuid); } catch { }
-                            try { SetProp(newBdm, "GUID", bdmGuid); } catch { }
-                            SetProp(newBdm, "BlockObjectId", blockGuid);
-                            try { SetProp(newBdm, "TBlock", newBlock); } catch { }
-                            // DM.Detail: shared
-
-                            if (bdmBit == bit)
-                                SetProp(newBdm, "CustomName", dmName);
-                            else
-                                SetProp(newBdm, "CustomName", $"DM_ERR_{bdmBit:D2}");
-
-                            newDMsList.Add(newBdm);
-                            repoDMs.Add(newBdm);
-
-                            if (bdmBit == bit)
-                                SetProp(newError, "DetectionMethod", bdmGuid);
                         }
                     }
 
@@ -2000,7 +2269,7 @@ class Program
             }
             else
             {
-                // No block_name: just template + DM + error (no TBlock)
+                // No block_name: template + DM + error only (no TBlock)
                 resultJson = JsonSerializer.Serialize(new
                 {
                     status = "ok",

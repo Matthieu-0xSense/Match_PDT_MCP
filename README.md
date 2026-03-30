@@ -29,9 +29,9 @@ The PDT generates C code in `AUTO_CEN_*` folders — structs, enums, config arra
 
 **What can also be modified (binary .dat — via .NET helper):**
 - Database variables in `project.dat` — add, update, delete parameters across NvMem/RAM databases
+- Custom error definitions — add custom errors with error templates, detection methods, and ERR TBlocks (modifies both `project.dat` and `Errors.dat` atomically)
 
 **What cannot be modified:**
-- Error definitions (`Errors.dat`)
 - ISOBUS config (`Isobus.dat`)
 
 ## Installation
@@ -80,7 +80,7 @@ Add a `.mcp.json` file in the project root directory:
 
 The server auto-discovers:
 - **HDB_PATH** — first `*.hdb` file in the working directory
-- **PDT_DIR** — latest version in `C:\Program Files\Hydac\Project Definition Tool\`
+- **PDT_DIR** — matched to the project's PDT version (from `info.xml`), falling back to the latest installed version in `C:\Program Files\Hydac\Project Definition Tool\`
 
 If the project has multiple `.hdb` files or a non-standard location, set environment variables explicitly:
 
@@ -179,6 +179,47 @@ These tools are optional. Without .NET SDK, they return an error message; all ot
 |------|-----------|-------------|
 | `list_errors` | `spn_filter: int`, `description_filter: str` | List error definitions with SPN, description, severity, debounce, thresholds. |
 | `get_error` | `spn: int` | Look up a specific error by SPN number. Returns full details. |
+| `list_error_templates` | *(none)* | List custom error block templates. |
+| `list_detection_methods` | `filter: str` | List detection methods with bit positions and FMI values. |
+| `list_fmi_definitions` | *(none)* | List FMI and FMI extension definitions with GUIDs. |
+| `add_custom_error` | `template`, `dm_name`, `bit`, `spn`, `block_name`, `description`, `severity`, `fmi`, `fmi_extended`, debounce/threshold params | Add a custom error with detection method, error template, and ERR TBlock. Works on projects with or without existing custom errors. |
+
+**`add_custom_error` details:**
+
+Creates a complete custom error entry in the PDT project (atomic operation — modifies both `project.dat` and `Errors.dat`). Creates `.hdb.bak` backup before the first write.
+
+- `template` (required): Error template/block name, e.g. `"Error index us"`. Creates a new template if not found.
+- `dm_name` (required): Detection method name, e.g. `"DM_US_HINDEX_EOB"`. Must be unique.
+- `bit` (required): Bit position within the block (0-7).
+- `spn` (required): SPN number. Must be unique across all errors.
+- `block_name`: Software error block name, e.g. `"ERR_INDEX_US"`. Required when creating a new template. Used as the TBlock name for code generation.
+- `description`: Error description text.
+- `severity`: 1=info, 3=warning (default), 5=critical.
+- `fmi`: FMI name, default `"FMI_31_CONDITION_EXISTS"`.
+- `fmi_extended`: FMI extension, default `"FMIEX_GLOBAL"`.
+- Debounce/threshold: `set_debounce_ms` (500), `release_debounce_ms` (0), `set_threshold` (500), `release_threshold` (1000).
+
+**What gets created:**
+1. **Error template** in `Custom.ErrorTemplates` (if new)
+2. **Detection method entries** in `Custom.DetectionMethods` and the template's `Error` list
+3. **Error entry** in `Errors.dat` with SPN, severity, FMI, debounce settings
+4. **ERR TBlock** with 8 detection method slots (bits 0-7), block parameters (SW_MODULE, BLOCK_NAME, ERROR_COUNT), and the Standard library ERR blueprint
+5. **Template-to-TBlock link** via `LinkedBlockIds`
+
+When the project has no existing ERR blocks, the tool auto-discovers a sibling project with ERR blocks (in `C:\Match\Projects\`) and clones the block structure from there, including TBlockParamSections and TDetectionMethods.
+
+**Example:**
+```
+add_custom_error(
+    template="Error test dummy",
+    dm_name="DM_TEST_DUMMY_ALARM",
+    bit=0,
+    spn=2000,
+    block_name="ERR_TEST_DUMMY",
+    description="Dummy test alarm for validation",
+    severity=3
+)
+```
 
 ### XML Write Tools
 
@@ -215,7 +256,7 @@ These tools are optional. Without .NET SDK, they return an error message; all ot
 
 | File | Status | Content |
 |------|--------|---------|
-| `Errors.dat` | Curated read | Error definitions (SPN, severity, thresholds, reactions) |
+| `Errors.dat` | Read + write | Error definitions (SPN, severity, thresholds, reactions). Custom errors can be added via `add_custom_error`. |
 | `CompileConfig.dat` | Curated read | Build mode, log level, flags |
 | `Isobus.dat` | Curated read | ISOBUS configuration |
 | `project.dat` | Read + write | Main project data (pins, blocks, FMI definitions). Database variables are read/write. |
@@ -233,7 +274,9 @@ Compares all XML files (element-level by ID/Name) and all .dat files (JSON deep-
 
 ## Limitations
 
-- **Most `.dat` files are read-only** — only database variables in `project.dat` support write-back. The generic `dump` command can read all .dat files to JSON for diffing.
+- **Most `.dat` files are read-only** — `project.dat` (database variables, custom errors/templates) and `Errors.dat` (error entries) support write-back. The generic `dump` command can read all .dat files to JSON for diffing.
+- **PDT version matching** — the server auto-matches the PDT installation to the project's version (from `info.xml`). If the exact version is not installed, it falls back to the latest available and logs a warning.
+- **ERR block cloning** — when adding custom errors to a project without existing ERR blocks, the tool searches sibling projects for an ERR block to clone structure from. If no reference project is found, the error template and detection method are still created, but without a TBlock.
 - **Pin name resolution** requires cross-referencing GUIDs through `project.dat`. The `dump project.dat` command now exposes pin data.
 - **Error GUID fields** (Fmi, DetectionMethod, MachineFunction, RestrictedMode) reference objects in `project.dat` and can't be resolved to names.
 - **Signal name duplicates** — many signals share the same name across different messages. Use the `message` parameter in `get_can_signal` to disambiguate.

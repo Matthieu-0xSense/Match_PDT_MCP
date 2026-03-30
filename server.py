@@ -13,7 +13,7 @@ import zipfile
 from mcp.server.fastmcp import FastMCP
 
 from parser import (
-    HDB_PATH, PDT_DIR,
+    HDB_PATH, PDT_DIR, _resolve_pdt_dir,
     get_cache, clear_cache, get_errors,
     get_detection_methods as _get_detection_methods,
     get_fmi_definitions as _get_fmi_definitions,
@@ -1320,12 +1320,14 @@ def reload_hdb() -> str:
     db_count = len(data["databases"])
     info = f"Reloaded {HDB_PATH}\n  {msg_count} CAN messages, {sig_count} signals, {db_count} databases"
 
-    if PDT_DIR:
+    pdt_dir = _resolve_pdt_dir(HDB_PATH) if HDB_PATH else PDT_DIR
+    if pdt_dir:
         try:
             errors = get_errors()
             info += f", {len(errors)} errors"
         except Exception:
             info += " (errors: reload failed — check PDT_DIR)"
+        info += f"\n  PDT: {pdt_dir}"
 
     return info
 

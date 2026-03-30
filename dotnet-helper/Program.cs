@@ -1991,11 +1991,19 @@ class Program
 
                                                         // BlockParameterDetail: shared (empty Detail objects cause deserialization NullRef)
 
-                                        if ((GetPropValue<string>(newParam, "Name") ?? "") == "BLOCK_NAME")
+                                        var paramName2 = GetPropValue<string>(newParam, "Name") ?? "";
+                                        if (paramName2 == "BLOCK_NAME")
                                         {
                                             SetProp(newParam, "ValueText", blockName);
                                             var vd = GetProp(newParam, "ValueData");
                                             if (vd != null) try { SetProp(vd, "Value", blockName); } catch { }
+                                        }
+                                        else if (paramName2 == "ERROR_COUNT")
+                                        {
+                                            SetProp(newParam, "ValueText", "8");
+                                            try { SetProp(newParam, "ValueAsInteger", 8); } catch { }
+                                            var vd = GetProp(newParam, "ValueData");
+                                            if (vd != null) try { SetProp(vd, "Value", (byte)8); } catch { }
                                         }
 
                                         newParams.Add(newParam);
@@ -2134,11 +2142,19 @@ class Program
                                                 catch { }
                                             }
 
-                                            if ((GetPropValue<string>(newParam, "Name") ?? "") == "BLOCK_NAME")
+                                            var paramName = GetPropValue<string>(newParam, "Name") ?? "";
+                                            if (paramName == "BLOCK_NAME")
                                             {
                                                 SetProp(newParam, "ValueText", blockName);
                                                 var vd = GetProp(newParam, "ValueData");
                                                 if (vd != null) try { SetProp(vd, "Value", blockName); } catch { }
+                                            }
+                                            else if (paramName == "ERROR_COUNT")
+                                            {
+                                                SetProp(newParam, "ValueText", "8");
+                                                try { SetProp(newParam, "ValueAsInteger", 8); } catch { }
+                                                var vd = GetProp(newParam, "ValueData");
+                                                if (vd != null) try { SetProp(vd, "Value", (byte)8); } catch { }
                                             }
 
                                             newParams.Add(newParam);

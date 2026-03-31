@@ -1115,10 +1115,14 @@ def _build_ecu_link_element(msg_guid, direction, ecu_id, send_buffer, recv_buffe
     link = ET.Element("CanMessageEcuLinkDataObject")
     _sub(link, "VirtualEcuId", ecu_id)
     _sub(link, "CanMessageId", msg_guid)
-    _sub(link, "Usage", direction)
+    # Usage set to "None" so the message appears unassigned in PDT.
+    # The CSND/CRCV block (stored in project.dat as .NET binary) cannot be
+    # created from XML alone.  When the user switches Usage from None to
+    # TXC/RXC in PDT's Network tab, PDT auto-creates the block.
+    _sub(link, "Usage", "None")
     buf = recv_buffer if direction == "Receive" else send_buffer
     _sub(link, "BufferBlockObjectId", buf)
-    _sub(link, "CanBlockObjectId", str(uuid.uuid4()))
+    _sub(link, "CanBlockObjectId", "00000000-0000-0000-0000-000000000000")
     return link
 
 
@@ -1296,10 +1300,13 @@ def add_can_message(
     except Exception as e:
         return f"Message added but reload failed: {e}"
 
+    dir_label = "TXC" if direction != "Receive" else "RXC"
+    note = (f"\n\n**Note:** In PDT → Network tab, change Usage from None to "
+            f"{dir_label} to auto-create the Message Block.")
     msg_data = data["messages_by_name"].get(name.lower())
     if msg_data:
-        return f"OK — Added message to HDB.\n\n{fmt_message(msg_data)}"
-    return f"OK — Added '{name}' (CAN ID {can_id}) with {len(sig_defs)} signal(s)."
+        return f"OK — Added message to HDB.\n\n{fmt_message(msg_data)}{note}"
+    return f"OK — Added '{name}' (CAN ID {can_id}) with {len(sig_defs)} signal(s).{note}"
 
 
 # ---------------------------------------------------------------------------

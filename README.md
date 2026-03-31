@@ -149,6 +149,17 @@ This creates:
 - ECU link with the correct send buffer for that bus
 - 3 signals: `testValue` (16-bit at bit 0), `status` (8-bit at bit 16), `mode` (4-bit at bit 24)
 
+**Important — Message Block assignment in PDT:**
+
+New messages are created with Usage set to `None` in the Network tab. This is intentional: the CSND/CRCV software block (stored in `project.dat` as .NET binary serialization) cannot be created from XML alone. To finalize the message:
+
+1. Open the project in PDT
+2. Go to the message → **Network** tab
+3. Change **Usage** from `None` to `TXC` (for send) or `RXC` (for receive)
+4. PDT auto-creates the Message Block
+
+After this step, the message is fully configured and code generation will include the `gCSnd_t*` / `gCRcv_t*` structs.
+
 **Visual walkthrough:**
 
 Adding a CAN message from Claude Code:
@@ -280,6 +291,7 @@ Compares all XML files (element-level by ID/Name) and all .dat files (JSON deep-
 - **Pin name resolution** requires cross-referencing GUIDs through `project.dat`. The `dump project.dat` command now exposes pin data.
 - **Error GUID fields** (Fmi, DetectionMethod, MachineFunction, RestrictedMode) reference objects in `project.dat` and can't be resolved to names.
 - **Signal name duplicates** — many signals share the same name across different messages. Use the `message` parameter in `get_can_signal` to disambiguate.
+- **CAN Message Blocks** — `add_can_message` cannot create CSND/CRCV software blocks (stored in `project.dat` binary format). New messages are created with Usage=None. The user must set Usage to TXC/RXC in PDT to trigger block creation.
 
 ## Dependencies
 

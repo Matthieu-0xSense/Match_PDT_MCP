@@ -22,22 +22,11 @@ import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from parser import _resolve_pdt_dir
+
 
 SCRIPT_DIR = Path(__file__).parent
 DOTNET_HELPER_EXE = SCRIPT_DIR / "dotnet-helper" / "bin" / "Release" / "net48" / "HdbDatReader.exe"
-
-
-def find_pdt_dir() -> str:
-    """Auto-discover PDT installation directory."""
-    env = os.environ.get("PDT_DIR")
-    if env and os.path.isdir(env):
-        return env
-    base = r"C:\Program Files\Hydac\Project Definition Tool"
-    if os.path.isdir(base):
-        versions = sorted(os.listdir(base), reverse=True)
-        if versions:
-            return os.path.join(base, versions[0])
-    raise RuntimeError("Cannot find PDT installation. Set PDT_DIR environment variable.")
 
 
 def get_zip_entry_hash(zf: zipfile.ZipFile, name: str) -> str:
@@ -195,7 +184,7 @@ def dump_dats(hdb_path: str, pdt_dir: str) -> dict:
     return json.loads(result.stdout)
 
 
-def generate_report(hdb_a: str, hdb_b: str, pdt_dir: str) -> str:
+def generate_report(hdb_a: str, hdb_b: str, pdt_dir: str = "") -> str:
     """Generate a markdown diff report comparing two .hdb files."""
     lines = []
     lines.append(f"# HDB Diff Report")
@@ -287,8 +276,10 @@ def generate_report(hdb_a: str, hdb_b: str, pdt_dir: str) -> str:
     dat_sections = []
     if dat_changed_names:
         try:
-            dats_a = dump_dats(hdb_a, pdt_dir)
-            dats_b = dump_dats(hdb_b, pdt_dir)
+            pdt_a = pdt_dir or _resolve_pdt_dir(hdb_a)
+            pdt_b = pdt_dir or _resolve_pdt_dir(hdb_b)
+            dats_a = dump_dats(hdb_a, pdt_a)
+            dats_b = dump_dats(hdb_b, pdt_b)
 
             for name in dat_changed_names:
                 if name not in dats_a:
@@ -337,11 +328,10 @@ def main():
     parser.add_argument("hdb_a", help="First .hdb file (base)")
     parser.add_argument("hdb_b", help="Second .hdb file (changed)")
     parser.add_argument("--output", "-o", help="Output file (default: stdout)")
-    parser.add_argument("--pdt-dir", help="PDT installation directory (auto-discovered if omitted)")
+    parser.add_argument("--pdt-dir", help="PDT installation directory override (auto-resolved per HDB if omitted)")
     args = parser.parse_args()
 
-    pdt_dir = args.pdt_dir or find_pdt_dir()
-    report = generate_report(args.hdb_a, args.hdb_b, pdt_dir)
+    report = generate_report(args.hdb_a, args.hdb_b, pdt_dir=args.pdt_dir or "")
 
     if args.output:
         Path(args.output).write_text(report, encoding="utf-8")

@@ -11,18 +11,18 @@
     <RootNamespace>MatchPdt.Helper</RootNamespace>
     <AssemblyName>Match_PDT_Helper_v2</AssemblyName>
     <!--
-      PDT's DataLayerFactory.CheckForNewerProjectVersion compares the project's saved
-      PdtVersionString against IApplicationVersionDetails.CurrentApplicationVersion,
-      which is derived from the entry assembly's version. As "Match_PDT_Helper_v2.exe"
-      we'd report 1.0.0.0 by default and PDT would refuse every modern project as
-      "saved with a newer version of PDT". Reporting a deliberately high version makes
-      the upper check pass; the lower "ProjectFileOlderVersionThanActualPdt" branch
-      still loads the project (verified by reading DataLayerFactory's flow in dnSpy).
+      We register a custom IApplicationVersionDetails at bootstrap that reports the
+      loaded PDT framework's actual file version; the helper's own AssemblyVersion is
+      no longer load-bearing and stays at the default 1.0.0.0.
     -->
-    <AssemblyVersion>99.99.99.0</AssemblyVersion>
-    <FileVersion>99.99.99.0</FileVersion>
     <PdtBaseDir Condition="'$(PdtBaseDir)' == ''">C:\Program Files\Hydac\Project Definition Tool</PdtBaseDir>
   </PropertyGroup>
+
+  <!-- System.IO.Compression for ZipArchive (used to patch info.xml inside the saved hdb). -->
+  <ItemGroup>
+    <Reference Include="System.IO.Compression" />
+    <Reference Include="System.IO.Compression.FileSystem" />
+  </ItemGroup>
 
   <!--
     PDT install dir resolution order:
@@ -86,6 +86,10 @@
           DependsOnTargets="ResolvePdtInstallDir">
     <Message Importance="high" Text="[Match_PDT_Helper_v2] PdtInstallDir = $(PdtInstallDir)" />
     <ItemGroup>
+      <Reference Include="Autofac">
+        <HintPath>$(PdtInstallDir)\Autofac.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
       <Reference Include="Hydac.PDT.Cli.Business">
         <HintPath>$(PdtInstallDir)\Hydac.PDT.Cli.Business.dll</HintPath>
         <Private>false</Private>
@@ -119,7 +123,15 @@
   </Target>
 
   <ItemGroup>
-    <PackageReference Include="Autofac" Version="6.5.0" />
+    <!--
+      Don't use the NuGet Autofac package: PDT ships its own Autofac.dll inside the
+      install dir and loads it at runtime. If we compile against a different one,
+      `Action<ContainerBuilder>` ends up as a different type identity, so any callback
+      we hand to CliInitialization.CreateApp throws "Impossible de convertir l'objet
+      de type 'Action<ContainerBuilder>' en type 'Action<ContainerBuilder>'" at the
+      reflection boundary. Reference PDT's Autofac with Private=false so we use the
+      same assembly identity at both compile and runtime.
+    -->
     <PackageReference Include="System.Text.Json" Version="8.0.5" />
   </ItemGroup>
 

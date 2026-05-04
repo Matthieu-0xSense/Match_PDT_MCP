@@ -220,9 +220,38 @@ Things the original plan got wrong, in order of how much pain they caused:
 - The `ConsoleWriterDialogServiceAdapter` registered by `CliSetup.RegisterCustomDependencies` writes dialog text to `Console.Out`, which is our JSON-RPC channel. server.py needs to drain stdout until the literal "Ready." line. Cleaner: register our own `IDialogServiceAdapter` via the customRegister callback that logs to stderr instead.
 - AssemblyVersion=99.99.99.0 will leak into project saves' `PdtVersionString`. Override `IApplicationVersionDetails` in Phase 2 (read the loaded `Hydac.PDT.PdtFramework.dll`'s file version and report that).
 
-## Phase 2 — partial: in-memory works, save round-trip fails
+## Phase 2 — partial: save round-trip works, error persistence partial
 
-**Status: WIP, gated behind `add_custom_error_experimental`. server.py must keep using v1 for `add_custom_error` until the save-corruption is fixed.**
+**Status: WIP, gated behind `add_custom_error_experimental`. server.py must keep using v1 for `add_custom_error` until full sub-manager wiring is in place.**
+
+### Save fix (this commit)
+
+Three issues had to be solved before save+reload could even round-trip:
+
+1. **`Action<ContainerBuilder>` type-identity**: PDT ships its own `Autofac.dll` and loads it at runtime. We were compiling against the NuGet `Autofac` package, so any callback we handed to `CliInitialization.CreateApp` failed at the reflection boundary with *"Impossible de convertir l'objet de type 'Action<ContainerBuilder>' en type 'Action<ContainerBuilder>'"*. Fix: drop the package, reference PDT's `Autofac.dll` directly with `Private=false`.
+2. **Version checks at load**: `IApplicationVersionDetails.CurrentApplicationVersion` is read from the entry assembly's version. As `Match_PDT_Helper_v2.exe v1.0.0.0` we triggered `CheckForOlderProjectVersion`'s "older than the helper" warning at load. Fix: replicate `CliSetup.CreateApplication` manually so we can wedge our own `customRegister` into `CliInitialization.CreateApp`. The wedge calls `CliSetup.RegisterCustomDependencies` reflectively for PDT's 13 surrogates, then registers our `HostApplicationVersionDetails` last (Autofac's last-registration-wins). `Delegate.CreateDelegate` doesn't bind to internal methods, so the wrapper invokes via reflection.
+3. **Save drops files / wrong version stamped**: `IProjectAgent.Save` recreates the .hdb from scratch and only writes back sub-systems that were loaded into memory. On a headless run, sub-managers like `Errors`, `KnowledgebaseAgent`, `CanMessages` lazy-load when their VMs are accessed in the UI — which never happens. Result: 16 of 32 entries silently disappear from the saved archive. **AND** `DataLayer.AddInfoFile` reads `Assembly.GetEntryAssembly().GetName().Version` directly (bypassing `IApplicationVersionDetails`), so info.xml's `PdtVersionString` becomes our `1.0.0.0`. Fixes:
+   - **Snapshot** the pristine .hdb at load (copy to `%TEMP%`).
+   - **Merge** at save: copy any entry from the snapshot that PDT didn't write back. Stale-but-valid is better than missing.
+   - **Patch** info.xml's `PdtVersionString` to the real loaded PDT version.
+
+Verified: clean Project_Test_changed.hdb (1.40 MB) → save_project → 1.61 MB → reload via the same helper succeeds (ping/pong, no exceptions). 16 carry-forward entries logged. info.xml correctly stamped 2.12.102.19.
+
+### What persists
+
+- **DM** created via `ITRepository.NewDetectionMethod` lives in `project.dat` / `Repository.DetectionMethods` — PDT writes project.dat back. After reload, `IDetectionMethodLoader.GetByDefinition` finds it.
+- **Error** created via `IErrorBuilder.CreateError` + `IProjectErrorFactory.AddToProject` lives in `Errors.dat` — which we carry forward from the pristine snapshot, so the **mutation is lost on save**. The DM exists post-reload; its error doesn't.
+
+### Next: force-load Errors sub-manager
+
+To make the error persist, we need the Errors sub-manager loaded BEFORE save, so `ProjectAgent.Save`'s persistence-adapter loop emits `Errors.dat` from the in-memory state. Likely entry points to investigate:
+- `Hydac.PDT.Errors.Business.Loader.LoadErrorsFromPersistence`
+- `Hydac.PDT.Errors.Business.Contracts.Loader.ILoadErrorsFromDataLayer`
+- Touching `IErrorCollection` (we already do — but the eager DataLayer-side load may need a separate trigger).
+
+When that's done, the snapshot-merge step can be made conditional / removed for files that PDT now correctly writes back.
+
+
 
 What works in `add_custom_error_experimental`:
 - v1 JSON contract (`template`, `dm_name`, `bit`, `spn`, `block_name`, `description`, `severity`, `fmi`, `fmi_extended`, `set/release_debounce_ms`, `set/release_threshold`) parsed and validated.

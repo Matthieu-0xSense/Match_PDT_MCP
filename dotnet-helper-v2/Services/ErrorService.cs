@@ -327,17 +327,26 @@ namespace MatchPdt.Helper.Services
                     ?? Guid.Empty;
                 Program.WriteLog(
                     $"IErrorBlockFactory.Create(ecuId={VirtualEcuId}, type=ERR, name={instanceName}, " +
-                    $"createErrors=true, initErrorDefs=true, blueprintGuid={blueprintGuid})");
+                    $"createErrors=false, initErrorDefs=true, blueprintGuid={blueprintGuid})");
 
                 var createMethod = factoryType.GetMethod("Create",
                     new[] { typeof(Guid), typeof(string), typeof(string),
                             typeof(bool), typeof(bool), typeof(Guid) })!;
 
+                // createErrors=false: don't auto-create the 8 default DM_ERR_00..07 error
+                // entries (otherwise PDT registers them as 8 real errors with auto-assigned
+                // SPNs in the project's error list — same as if we'd added 8 errors
+                // manually). Matches the GUI's "Create Block" behavior, which produces an
+                // empty block (Error Count = 0). Our subsequent IErrorBuilder.CreateError
+                // adds only the user-requested DM.
+                // initializeErrorDefinitions=true keeps the block's structural error-bit
+                // template (bits 0-7 still exist as slots, just unbound) so PDT can
+                // populate the bit list in the GUI properly.
                 object? itBlock;
                 try
                 {
                     itBlock = createMethod.Invoke(factory,
-                        new object[] { VirtualEcuId, "ERR", instanceName, true, true, blueprintGuid });
+                        new object[] { VirtualEcuId, "ERR", instanceName, false, true, blueprintGuid });
                 }
                 catch (TargetInvocationException tie) when (tie.InnerException is not null)
                 {

@@ -516,10 +516,8 @@ def add_custom_error(template: str, dm_name: str, bit: int, spn: int,
                      fmi_extended: str = "FMIEX_GLOBAL",
                      set_debounce_ms: int = 500, release_debounce_ms: int = 0,
                      set_threshold: int = 500, release_threshold: int = 1000) -> dict:
-    """Add a custom error (atomic: updates both project.dat and Errors.dat)."""
-    # Find a reference project with ERR blocks for cloning if needed
-    ref_hdb = _find_reference_hdb_with_err_block()
-    payload = json.dumps({
+    """Add a custom error via dotnet-helper-v2 (PDT services), with v1 fallback."""
+    params = {
         "template": template,
         "dm_name": dm_name,
         "bit": bit,
@@ -533,11 +531,23 @@ def add_custom_error(template: str, dm_name: str, bit: int, spn: int,
         "release_debounce_ms": release_debounce_ms,
         "set_threshold": set_threshold,
         "release_threshold": release_threshold,
-        "ref_hdb": ref_hdb,
-    })
-    result = _run_dotnet_helper("err-custom-add", timeout=60, stdin_data=payload)
-    clear_cache()
-    return result
+    }
+    try:
+        from helper_v2 import call as helper_v2_call, HelperError
+        result = helper_v2_call("add_custom_error", params, timeout=60)
+        clear_cache()
+        return result
+    except Exception as v2_err:
+        # v2 not built or runtime failure → fall back to v1 so the tool keeps working.
+        # The v2 path is still WIP for some edge cases (new-block creation, lazy-loaded
+        # sub-systems beyond Errors.dat); v1 covers them via the XML-direct path.
+        import sys as _sys
+        print(f"[Match_PDT_MCP] v2 add_custom_error failed ({v2_err}); falling back to v1", file=_sys.stderr)
+        ref_hdb = _find_reference_hdb_with_err_block()
+        payload = json.dumps({**params, "ref_hdb": ref_hdb})
+        result = _run_dotnet_helper("err-custom-add", timeout=60, stdin_data=payload)
+        clear_cache()
+        return result
 
 
 # ---------------------------------------------------------------------------

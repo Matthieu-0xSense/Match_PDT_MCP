@@ -62,12 +62,13 @@ namespace MatchPdt.Helper.Rpc
             {
                 return req.Method switch
                 {
-                    "ping"     => RpcResponse.Ok(req.Id, "pong"),
-                    "shutdown" => RpcResponse.Ok(req.Id, "ok"),
+                    "ping"         => RpcResponse.Ok(req.Id, "pong"),
+                    "shutdown"     => RpcResponse.Ok(req.Id, "ok"),
+                    "save_project" => SaveProject(req),
 
                     // Phase 2+ handlers plug in here:
-                    // "add_custom_error" => ErrorService.AddCustomError(_host, req),
-                    // "add_can_message"  => CanMessageService.Add(_host, req),
+                    // "add_custom_error" => Services.ErrorService.AddCustomError(_host, req),
+                    // "add_can_message"  => Services.CanMessageService.Add(_host, req),
 
                     _ => RpcResponse.Fail(req.Id, RpcErrorCodes.MethodNotFound, req.Method),
                 };
@@ -79,6 +80,12 @@ namespace MatchPdt.Helper.Rpc
                     RpcErrorCodes.InternalError,
                     $"{ex.GetType().Name}: {ex.Message}");
             }
+        }
+
+        private RpcResponse SaveProject(RpcRequest req)
+        {
+            _host.SaveProject();
+            return RpcResponse.Ok(req.Id, new { saved = _host.HdbFile.FullName });
         }
 
         private static void WriteResponse(RpcResponse resp)

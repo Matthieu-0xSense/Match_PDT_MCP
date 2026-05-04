@@ -102,7 +102,15 @@
         <HintPath>$(PdtInstallDir)\Hydac.PDT.Can.Business.dll</HintPath>
         <Private>false</Private>
       </Reference>
-      <!-- Phase 2+: add Hydac.PDT.Errors.Business, Hydac.PDT.Database.Business as needed. -->
+      <Reference Include="Hydac.PDT.Errors.Business">
+        <HintPath>$(PdtInstallDir)\Hydac.PDT.Errors.Business.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="Hydac.PDT.Errors.Business.Contracts">
+        <HintPath>$(PdtInstallDir)\Hydac.PDT.Errors.Business.Contracts.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <!-- Phase 4+: add Hydac.PDT.Database.Business as needed. -->
     </ItemGroup>
   </Target>
 

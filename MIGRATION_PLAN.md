@@ -271,6 +271,25 @@ Solution (in `HostBootstrap.WriteErrorsDat`): after `IProjectAgent.Save`, resolv
 
 The other lazy-loaded sub-systems (`HymlEcuTemplates.xml`, `CanMessages.xml`, `DatabaseLists.xml`, …) still rely on the snapshot carry-forward — their persistence pipelines will need similar wiring per phase (CAN messages in Phase 3, DB variables in Phase 4).
 
+### Known gaps (from PDT GUI verification)
+
+User-reported issues after opening `Project_Test_v2_verify.hdb` and comparing to a manually-fixed copy:
+
+1. **`TErrorTemplate.LinkedBlockIds` missing our block GUID.** The customTemplates collection in `project.dat` (`Repo.RepoProject.Detail.DetectionMethodData.Custom.ErrorTemplates`) holds entries like:
+   ```json
+   { "Type": "Error test dummy",
+     "LinkedBlockIds": ["<block-guid-1>", "<block-guid-2>", ...] }
+   ```
+   When we add an error to a block, we should append the block's ObjectId to the matching template's `LinkedBlockIds` list (matched by `Type == input.template`). v1 did this via reflection on the customTemplates collection; v2 doesn't.
+
+2. **Block's error-count `TBlockParam` not updated.** Each block has a `TBlockParam` with `ConnectedBlockType=ERR` whose `ValueText`/`ValueAsInteger` should reflect the count of errors in the block. v1's CustomErrorAdd implicitly handled this; v2 leaves it at 0.
+
+3. **`TDetectionMethodTemplate` entry not created in customDMs.** v1 added a DM template entry to `project.dat`'s customDMs collection in addition to the main DM creation. v2's `ITRepository.NewDetectionMethod` creates the per-block DM but not the template-level customDM.
+
+These all live in the project.dat reflection-style collections that PDT's `IDetectionMethodTemplate` (the contract-side abstraction) doesn't expose. Implementation will need to mirror v1's reflection approach: navigate the DataLayer → Repo → RepoProject → Detail → DetectionMethodData → Custom paths and patch the collections directly.
+
+Verb expansion: `delete_err_block` + `dump_block_types` already shipped — both useful primitives for the next iteration.
+
 ### Other dup-check fix
 
 `IDetectionMethod` (the project-level model) exposes `Name`, not `Detection`. v1's CustomErrorAdd checked `TDetectionMethodTemplate.Detection` because that lived on a different layer (project.dat's customDMs collection). The v2 dup check now reads `dm.Name`.

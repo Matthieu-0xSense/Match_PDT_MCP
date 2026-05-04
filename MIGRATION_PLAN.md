@@ -271,6 +271,21 @@ Solution (in `HostBootstrap.WriteErrorsDat`): after `IProjectAgent.Save`, resolv
 
 The other lazy-loaded sub-systems (`HymlEcuTemplates.xml`, `CanMessages.xml`, `DatabaseLists.xml`, …) still rely on the snapshot carry-forward — their persistence pipelines will need similar wiring per phase (CAN messages in Phase 3, DB variables in Phase 4).
 
+### No higher-level service for project.dat customTemplates
+
+Investigated whether a PDT service maintains `customTemplates.ErrorTemplates[].LinkedBlockIds` automatically when an error is added. **It doesn't.** Findings:
+
+- `ErrorOperationsVM.AddNewErrorCommand` (the GUI's "+" button) — just calls `errorBuilder.CreateAndAddEmptyError()`. Same path v2 uses. Doesn't touch templates.
+- `DetectionMethodLinkObserver` — only raises a `BlockLoaderSourcesChanged` event when a block is added, doesn't mutate template-side state.
+- `IDetectionMethodTemplate` (the contract abstraction over `TErrorTemplate`) — exposes only `DefaultFmi`, `DefaultFmiEx`, `Description`. Not `LinkedBlockIds`.
+- The template-level fields in project.dat (Type, LinkedBlockIds, customDM template entries) are maintained by separate UI flows (template creation dialogs), not by the add-error flow.
+
+So those last-mile fields require either:
+- v1-style reflection on `DataLayer.Repo.RepoProject.Detail.DetectionMethodData.Custom` paths, OR
+- A separate "create_template" verb that the caller runs before add_custom_error when a new template is needed.
+
+The v1 reflection is the simpler path — port that block of code into v2. The custom-template creation is a per-template concern, not per-error, and could be a separate verb.
+
 ### Known gaps (from PDT GUI verification)
 
 User-reported issues after opening `Project_Test_v2_verify.hdb` and comparing to a manually-fixed copy:

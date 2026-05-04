@@ -25,15 +25,17 @@ namespace MatchPdt.Helper.Bootstrap
     {
         public string SmokeTestServiceTypeName { get; }
         public object Project { get; }
+        public FileInfo HdbFile { get; }
 
         private readonly Type _cliInitializationType;
         private bool _disposed;
 
-        private HostBootstrap(Type cliInitializationType, object project, string smokeTestServiceTypeName)
+        private HostBootstrap(Type cliInitializationType, object project, string smokeTestServiceTypeName, FileInfo hdbFile)
         {
             _cliInitializationType = cliInitializationType;
             Project = project;
             SmokeTestServiceTypeName = smokeTestServiceTypeName;
+            HdbFile = hdbFile;
         }
 
         public static HostBootstrap Initialize(FileInfo hdbFile)
@@ -107,7 +109,39 @@ namespace MatchPdt.Helper.Bootstrap
             return new HostBootstrap(
                 cliInitType,
                 project,
-                messageService.GetType().FullName ?? "<unknown>");
+                messageService.GetType().FullName ?? "<unknown>",
+                hdbFile);
+        }
+
+        /// <summary>
+        /// Save the project back to its original .hdb path via IProjectAgent.Save.
+        /// IProjectAgent.Save handles DataLayer, Journals, ProjectLog, persistence
+        /// adapters, Protocols, DocumentAgent, Devices, UICan, and ProjectKnowledgeAgent.
+        /// Must be called on the dispatcher thread.
+        /// </summary>
+        public void SaveProject()
+        {
+            // IProjectService is in Hydac.PDT.Business.Interfaces; resolve by type name to
+            // avoid pulling that assembly into compile-time references for save alone.
+            var businessIfaces = Assembly.Load("Hydac.PDT.Business.Interfaces");
+            var projectServiceType = businessIfaces.GetType(
+                "Hydac.PDT.Business.Contracts.Project.IProjectService", throwOnError: true)!;
+            var projectService = ResolveByReflection(projectServiceType)
+                ?? throw new InvalidOperationException("IProjectService not registered");
+
+            var actualAgent = projectServiceType.GetProperty("ActualProjectAgent")!.GetValue(projectService)
+                ?? throw new InvalidOperationException("IProjectService.ActualProjectAgent is null — no project loaded");
+
+            var save = actualAgent.GetType().GetMethod("Save", new[] { typeof(string) })
+                ?? throw new MissingMethodException("IProjectAgent.Save(string)");
+            try
+            {
+                save.Invoke(actualAgent, new object[] { HdbFile.FullName });
+            }
+            catch (TargetInvocationException tie) when (tie.InnerException is not null)
+            {
+                throw tie.InnerException;
+            }
         }
 
         /// <summary>

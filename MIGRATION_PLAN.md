@@ -180,7 +180,7 @@ The helper only handles writes that benefit from going through PDT services.
 ## Open questions (verify against the live binaries)
 
 1. ~~Is `ServiceLocator` public?~~ **Yes.** Verified.
-2. What's the `IProject` save method? `SaveAsync`? Via `IMain`? **TODO Phase 2.**
+2. ~~What's the `IProject` save method?~~ **`IProjectAgent.Save(string fullName)`**, resolved via `IProjectService.ActualProjectAgent`. Not on `IProject` at all. Verified end-to-end: HDB round-trips through `Save` and the resulting archive is byte-different (PDT recompresses), with the project still re-openable. Phase 2 plumbing landed; now exposed as RPC method `save_project`.
 3. Does `MessageService.Add*` exist, or is creation only via repositories? `MessageService` has setters but the constructor takes `ICanMessageRepository` — creation may be `repository.Add(new CanMessage { ... })`. **TODO Phase 3.**
 4. Are there Autofac lifetime scope issues when the helper runs across multiple project loads? `ServiceLocator.CloseProjectScope()` exists — likely needs to be called between project loads. **TODO Phase 1 reload test.**
 5. ~~Does `CliApplicationSettings` need a real `IFeatureAgent`?~~ Registered by `Hydac.PDT.FeatureAgent.Installer` inside `RootInstaller`. No action needed.
@@ -219,6 +219,23 @@ Things the original plan got wrong, in order of how much pain they caused:
 
 - The `ConsoleWriterDialogServiceAdapter` registered by `CliSetup.RegisterCustomDependencies` writes dialog text to `Console.Out`, which is our JSON-RPC channel. server.py needs to drain stdout until the literal "Ready." line. Cleaner: register our own `IDialogServiceAdapter` via the customRegister callback that logs to stderr instead.
 - AssemblyVersion=99.99.99.0 will leak into project saves' `PdtVersionString`. Override `IApplicationVersionDetails` in Phase 2 (read the loaded `Hydac.PDT.PdtFramework.dll`'s file version and report that).
+
+## Phase 2 — foundation in place, mapping pending
+
+What's landed (this commit):
+- `HostBootstrap.SaveProject()` — resolves `IProjectService.ActualProjectAgent` and invokes `Save(string)` with the original `.hdb` path. Verified: hdb round-trips, archive recompresses to a different byte stream, project re-opens cleanly.
+- `RpcLoop` dispatches `save_project` → returns `{"saved": "<absolute path>"}`.
+- `dotnet-helper-v2/Services/ErrorService.cs` — skeleton handler. `add_custom_error` returns `MethodNotFound` until the mapping is implemented; server.py keeps using v1 in the meantime.
+- csproj now references `Hydac.PDT.Errors.Business` and `Hydac.PDT.Errors.Business.Contracts` — ready for the mapping work.
+
+What's pending for the actual `add_custom_error` mapping:
+- `IErrorBuilder.CreateError(Guid blockId, uint bit, IHymlError, IDetectionMethod)` — needs `IHymlError` from the knowledge base (FMI templates) and `IDetectionMethod` constructed via `IDetectionMethodFactory`.
+- `IErrorBlockFactory.Create` for the "create new ERR block" path — replaces v1's sibling-project clone hack.
+- `IDetectionMethodTemplateLoader` to find/create template entries.
+- v1 contract to preserve (matches Python `add_custom_error` signature):
+  - in: `template`, `dm_name`, `bit`, `spn`, `block_name`, `description`, `severity`, `fmi`, `fmi_extended`, `set_debounce_ms`, `release_debounce_ms`, `set_threshold`, `release_threshold`
+  - out: `{status, message, spn, dm_name, dm_guid, template, block_name, object_id, new_block}`
+- Save semantics: helper should call `SaveProject` after a successful mutation; the v2 server.py wiring will assume single-shot "mutate + save" rather than multiple staged mutations.
 
 ## Success criteria for Phase 1
 

@@ -62,13 +62,23 @@ namespace MatchPdt.Helper.Rpc
             {
                 return req.Method switch
                 {
-                    "ping"         => RpcResponse.Ok(req.Id, "pong"),
-                    "shutdown"     => RpcResponse.Ok(req.Id, "ok"),
-                    "save_project" => SaveProject(req),
+                    "ping"          => RpcResponse.Ok(req.Id, "pong"),
+                    "shutdown"      => RpcResponse.Ok(req.Id, "ok"),
+                    "save_project"  => SaveProject(req),
 
-                    // Phase 2+ handlers plug in here:
-                    // "add_custom_error" => Services.ErrorService.AddCustomError(_host, req),
-                    // "add_can_message"  => Services.CanMessageService.Add(_host, req),
+                    // add_custom_error: in-memory mutation succeeds (JSON contract matches v1,
+                    // services resolve, DM + error are created and added), but the saved HDB
+                    // fails to reload with "given key was not present in the dictionary".
+                    // Last-mile wiring missing — likely TDetectionMethod.Idx, an
+                    // IDetectionMethodTemplate entry, or a block-level collection link the
+                    // ErrorBuilder doesn't touch. Until that's resolved, server.py keeps
+                    // using the v1 dotnet-helper for this verb. Reachable as
+                    // "add_custom_error_experimental" for debugging.
+                    "add_custom_error"              => RpcResponse.Fail(req.Id, RpcErrorCodes.MethodNotFound,
+                                                          "add_custom_error not yet stable in v2 — server.py should fall back to v1"),
+                    "add_custom_error_experimental" => Services.ErrorService.AddCustomError(_host, req),
+
+                    // Phase 3+: "add_can_message" => Services.CanMessageService.Add(_host, req),
 
                     _ => RpcResponse.Fail(req.Id, RpcErrorCodes.MethodNotFound, req.Method),
                 };

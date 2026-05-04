@@ -110,6 +110,10 @@
         <HintPath>$(PdtInstallDir)\Hydac.PDT.Errors.Business.Contracts.dll</HintPath>
         <Private>false</Private>
       </Reference>
+      <Reference Include="Hydac.MATCH.HyML.Contract">
+        <HintPath>$(PdtInstallDir)\Hydac.MATCH.HyML.Contract.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
       <!-- Phase 4+: add Hydac.PDT.Database.Business as needed. -->
     </ItemGroup>
   </Target>

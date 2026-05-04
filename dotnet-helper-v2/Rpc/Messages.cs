@@ -8,6 +8,21 @@ namespace MatchPdt.Helper.Rpc
         [JsonPropertyName("id")]      public int Id { get; set; }
         [JsonPropertyName("method")]  public string Method { get; set; } = "";
         [JsonPropertyName("params")]  public System.Text.Json.JsonElement? Params { get; set; }
+
+        public T? GetParam<T>(string name) where T : struct
+            => (Params is { } p && p.ValueKind == System.Text.Json.JsonValueKind.Object && p.TryGetProperty(name, out var v))
+                ? System.Text.Json.JsonSerializer.Deserialize<T?>(v.GetRawText())
+                : null;
+
+        public string GetStringParam(string name, string fallback = "")
+            => (Params is { } p && p.ValueKind == System.Text.Json.JsonValueKind.Object && p.TryGetProperty(name, out var v) && v.ValueKind == System.Text.Json.JsonValueKind.String)
+                ? (v.GetString() ?? fallback)
+                : fallback;
+
+        public int GetIntParam(string name, int fallback = 0)
+            => (Params is { } p && p.ValueKind == System.Text.Json.JsonValueKind.Object && p.TryGetProperty(name, out var v) && v.ValueKind == System.Text.Json.JsonValueKind.Number)
+                ? v.GetInt32()
+                : fallback;
     }
 
     internal sealed class RpcResponse

@@ -1115,11 +1115,15 @@ def _build_ecu_link_element(msg_guid, direction, ecu_id, send_buffer, recv_buffe
     link = ET.Element("CanMessageEcuLinkDataObject")
     _sub(link, "VirtualEcuId", ecu_id)
     _sub(link, "CanMessageId", msg_guid)
-    # Usage set to "None" so the message appears unassigned in PDT.
-    # The CSND/CRCV block (stored in project.dat as .NET binary) cannot be
-    # created from XML alone.  When the user switches Usage from None to
-    # TXC/RXC in PDT's Network tab, PDT auto-creates the block.
-    _sub(link, "Usage", "None")
+    # The CanMessageEcuLinkUsage XML enum only accepts Receive,
+    # SendCyclically, SendEventBased — passing it the same string we got
+    # in the `direction` argument matches the validated set above.
+    # Older PDT versions may have accepted "None" here; current PDT
+    # (>=2.12) rejects the project on load if the value is not in the enum.
+    # The CSND/CRCV software block (stored in project.dat as .NET binary)
+    # is still NOT created by setting this — that requires reopening the
+    # message in PDT's Network tab so PDT can persist the block.
+    _sub(link, "Usage", direction)
     buf = recv_buffer if direction == "Receive" else send_buffer
     _sub(link, "BufferBlockObjectId", buf)
     _sub(link, "CanBlockObjectId", "00000000-0000-0000-0000-000000000000")
@@ -1301,8 +1305,10 @@ def add_can_message(
         return f"Message added but reload failed: {e}"
 
     dir_label = "TXC" if direction != "Receive" else "RXC"
-    note = (f"\n\n**Note:** In PDT → Network tab, change Usage from None to "
-            f"{dir_label} to auto-create the Message Block.")
+    note = (f"\n\n**Note:** Usage is set to '{direction}' in the XML, but the "
+            f"CSND/CRCV software block is NOT created by this tool. Open the "
+            f"message in PDT → Network tab and re-set Usage to {dir_label} "
+            f"(or toggle it) to make PDT generate the Message Block.")
     msg_data = data["messages_by_name"].get(name.lower())
     if msg_data:
         return f"OK — Added message to HDB.\n\n{fmt_message(msg_data)}{note}"

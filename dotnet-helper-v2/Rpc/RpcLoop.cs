@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
 using System.Windows.Threading;
@@ -66,6 +67,7 @@ namespace MatchPdt.Helper.Rpc
                     "shutdown"         => RpcResponse.Ok(req.Id, "ok"),
                     "save_project"     => SaveProject(req),
                     "add_custom_error" => Services.ErrorService.AddCustomError(_host, req),
+                    "probe_type"       => ProbeType(req),
 
                     // Phase 3+: "add_can_message" => Services.CanMessageService.Add(_host, req),
 
@@ -85,6 +87,53 @@ namespace MatchPdt.Helper.Rpc
         {
             _host.SaveProject();
             return RpcResponse.Ok(req.Id, new { saved = _host.HdbFile.FullName });
+        }
+
+        // Diagnostic: resolve any IFoo via ServiceLocator and report the concrete type +
+        // its assembly + ctor dependencies. Lets us inspect bindings that dnSpy class
+        // browsing can't easily surface. Params: { "interface": "Hydac.PDT...IFoo",
+        // "assembly": "Hydac.PDT.Business.Interfaces" }
+        private RpcResponse ProbeType(RpcRequest req)
+        {
+            var iface = req.GetStringParam("interface");
+            var assembly = req.GetStringParam("assembly");
+            if (string.IsNullOrEmpty(iface) || string.IsNullOrEmpty(assembly))
+                return RpcResponse.Fail(req.Id, RpcErrorCodes.InvalidRequest,
+                    "probe_type needs {interface, assembly}");
+
+            try
+            {
+                var asm = System.Reflection.Assembly.Load(assembly);
+                var t = asm.GetType(iface, throwOnError: true)!;
+                var instance = Bootstrap.HostBootstrap.ResolveByReflection(t);
+                if (instance == null)
+                    return RpcResponse.Ok(req.Id, new { resolved = false, reason = "ServiceLocator returned null" });
+
+                var concrete = instance.GetType();
+                var ctors = concrete.GetConstructors(System.Reflection.BindingFlags.Public |
+                                                    System.Reflection.BindingFlags.NonPublic |
+                                                    System.Reflection.BindingFlags.Instance);
+                var methods = concrete.GetMethods(System.Reflection.BindingFlags.Public |
+                                                  System.Reflection.BindingFlags.NonPublic |
+                                                  System.Reflection.BindingFlags.Instance |
+                                                  System.Reflection.BindingFlags.DeclaredOnly)
+                    .Select(m => $"{(m.IsPublic ? "public" : "internal")} {m.ReturnType.Name} {m.Name}({string.Join(",", m.GetParameters().Select(p => p.ParameterType.Name))})")
+                    .Take(50)
+                    .ToList();
+                return RpcResponse.Ok(req.Id, new
+                {
+                    resolved = true,
+                    concrete_type = concrete.FullName,
+                    assembly = concrete.Assembly.GetName().Name,
+                    ctors = ctors.Select(c => string.Join(", ", c.GetParameters().Select(p => $"{p.ParameterType.FullName} {p.Name}"))).ToList(),
+                    methods,
+                });
+            }
+            catch (Exception ex)
+            {
+                return RpcResponse.Fail(req.Id, RpcErrorCodes.InternalError,
+                    $"{ex.GetType().Name}: {ex.Message}");
+            }
         }
 
         private static void WriteResponse(RpcResponse resp)

@@ -275,6 +275,42 @@ The other lazy-loaded sub-systems (`HymlEcuTemplates.xml`, `CanMessages.xml`, `D
 
 `IDetectionMethod` (the project-level model) exposes `Name`, not `Detection`. v1's CustomErrorAdd checked `TDetectionMethodTemplate.Detection` because that lived on a different layer (project.dat's customDMs collection). The v2 dup check now reads `dm.Name`.
 
+### Diagnostic probe verb
+
+A `probe_type` JSON-RPC verb resolves any DI interface and reports the concrete type, defining assembly, ctor signature, and declared methods. Useful when dnSpy class-browsing can't surface a registration. Example response that unblocked the new-block path:
+
+```
+probe_type {interface: "IErrorBlockFactory", assembly: "Hydac.PDT.Business.Interfaces"}
+→ resolved: true
+  concrete_type: Hydac.PDT.ViewModel.Workspace._07_Ecus.SafetyErrors.ErrorBlockFactory
+  assembly: ViewModel
+  ctor: (IProjectAgent, TBlockArguments.Factory, ICreateBlockCommand)
+  methods:
+    public ITBlock Create(Guid, String, String, Boolean, Boolean, Guid)
+```
+
+### Next iteration — create-new-block path
+
+`IErrorBlockFactory.Create` (in `ViewModel.dll`) takes `(Guid ecuId, string typeName, string instanceName, bool createErrors, bool initializeErrorDefinitions, Guid ownerId)` and internally:
+1. Looks up `ITEcu` by GUID in `_projectAgent.Repository.Ecus`.
+2. Builds an `IBlockArguments` via the registered factory (typeName="ERR", ownerId = IHymlBlock blueprint GUID).
+3. Checks match-version compatibility.
+4. Sets `CreateErrors = true` and optionally calls `InitializeErrorDefinitions()`.
+5. Invokes `ICreateBlockCommand.Execute(blockArguments)` — same path the GUI uses for File → Create Block.
+6. Returns `blockArguments.Result` as ITBlock.
+
+To wire this into `add_custom_error` for the new-block branch:
+1. Resolve `IErrorBlockFactory` via ServiceLocator.
+2. ECU GUID: take the first VirtualEcu (we already do this for `DetectionMethodLoadParameter`).
+3. Blueprint GUID: scan `IBlockRepository.GetByType("ERR")` and pick one with a non-empty `BlockTemplate`/blueprint reference. v1's "sibling project" hack disappears — any in-project ERR block's blueprint is valid.
+4. `typeName="ERR"`, `instanceName=block_name`, `createErrors=true`, `initializeErrorDefinitions=true`.
+5. After `Create` returns the ITBlock, proceed with the existing DM + error path against the new block.
+
+Open questions before implementing:
+- Does the test project have at least one ERR block with a valid blueprint to clone? Verified yes (ERR_TEST_DUMMY exists, but check it has `BlockTemplate != Guid.Empty`).
+- Does `ICreateBlockCommand.Execute` need to run on the dispatcher? Most likely yes — it's a UI command. Already covered since RpcLoop dispatches handlers there.
+- Does the new block's persistence flow through `WriteErrorsDat` automatically, or do we need an additional save adapter for `HymlEcuTemplates.xml`? That file is currently in the snapshot-merge fallback list.
+
 
 
 What works in `add_custom_error_experimental`:

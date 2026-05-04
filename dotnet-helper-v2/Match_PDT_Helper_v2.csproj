@@ -1,0 +1,114 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- net48 keeps us aligned with PDT.exe (which targets the .NET Framework). WPF
+         Dispatcher requires a Windows-Desktop SKU; net48 gives that for free. -->
+    <TargetFramework>net48</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <RootNamespace>MatchPdt.Helper</RootNamespace>
+    <AssemblyName>Match_PDT_Helper_v2</AssemblyName>
+    <!--
+      PDT's DataLayerFactory.CheckForNewerProjectVersion compares the project's saved
+      PdtVersionString against IApplicationVersionDetails.CurrentApplicationVersion,
+      which is derived from the entry assembly's version. As "Match_PDT_Helper_v2.exe"
+      we'd report 1.0.0.0 by default and PDT would refuse every modern project as
+      "saved with a newer version of PDT". Reporting a deliberately high version makes
+      the upper check pass; the lower "ProjectFileOlderVersionThanActualPdt" branch
+      still loads the project (verified by reading DataLayerFactory's flow in dnSpy).
+    -->
+    <AssemblyVersion>99.99.99.0</AssemblyVersion>
+    <FileVersion>99.99.99.0</FileVersion>
+    <PdtBaseDir Condition="'$(PdtBaseDir)' == ''">C:\Program Files\Hydac\Project Definition Tool</PdtBaseDir>
+  </PropertyGroup>
+
+  <!--
+    PDT install dir resolution order:
+      1. /p:PdtInstallDir=... on the command line
+      2. $(PDT_DIR) env var
+      3. Highest version directory under $(PdtBaseDir) (resolved by PickLatestPdtVersion below)
+  -->
+  <PropertyGroup Condition="'$(PdtInstallDir)' == ''">
+    <PdtInstallDir>$(PDT_DIR)</PdtInstallDir>
+  </PropertyGroup>
+
+  <UsingTask TaskName="PickLatestPdtVersion" TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <BaseDir Required="true" />
+      <Result Output="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System" />
+      <Using Namespace="System.IO" />
+      <Using Namespace="System.Linq" />
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        Result = "";
+        if (Directory.Exists(BaseDir)) {
+            var best = Directory.GetDirectories(BaseDir)
+                .Select(p => new { Path = p, Name = Path.GetFileName(p) })
+                .Select(x => {
+                    Version v;
+                    return new { x.Path, Ok = Version.TryParse(x.Name, out v), Version = v };
+                })
+                .Where(x => x.Ok)
+                .OrderByDescending(x => x.Version)
+                .FirstOrDefault();
+            if (best != null) Result = best.Path;
+        }
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
+  <Target Name="ResolvePdtInstallDir" BeforeTargets="ResolveAssemblyReferences"
+          Condition="'$(PdtInstallDir)' == ''">
+    <PickLatestPdtVersion BaseDir="$(PdtBaseDir)">
+      <Output TaskParameter="Result" PropertyName="PdtInstallDir" />
+    </PickLatestPdtVersion>
+    <Error Condition="'$(PdtInstallDir)' == ''"
+           Text="No PDT install found under $(PdtBaseDir). Set /p:PdtInstallDir=... or `$env:PDT_DIR=...`." />
+  </Target>
+
+  <!--
+    PDT references must be added inside a target that runs after PdtInstallDir is
+    resolved — top-level <ItemGroup> Reference entries are evaluated before any
+    target runs, so $(PdtInstallDir) would still be empty there. Adding them
+    dynamically inside an MSBuild target works because items created in a target
+    use current property values.
+
+    Private=false: don't copy the DLLs to the output directory. The helper runs
+    with WorkingDirectory = <PDT install dir> so AppDomain.AssemblyResolve picks
+    them up at runtime; copying would IntelliLock-trip on a wrong path.
+  -->
+  <Target Name="AddPdtReferences" BeforeTargets="ResolveAssemblyReferences"
+          DependsOnTargets="ResolvePdtInstallDir">
+    <Message Importance="high" Text="[Match_PDT_Helper_v2] PdtInstallDir = $(PdtInstallDir)" />
+    <ItemGroup>
+      <Reference Include="Hydac.PDT.Cli.Business">
+        <HintPath>$(PdtInstallDir)\Hydac.PDT.Cli.Business.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="Hydac.PDT.PdtFramework">
+        <HintPath>$(PdtInstallDir)\Hydac.PDT.PdtFramework.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="Hydac.PDT.Business.Interfaces">
+        <HintPath>$(PdtInstallDir)\Hydac.PDT.Business.Interfaces.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="Hydac.PDT.Can.Business">
+        <HintPath>$(PdtInstallDir)\Hydac.PDT.Can.Business.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <!-- Phase 2+: add Hydac.PDT.Errors.Business, Hydac.PDT.Database.Business as needed. -->
+    </ItemGroup>
+  </Target>
+
+  <ItemGroup>
+    <PackageReference Include="Autofac" Version="6.5.0" />
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
+  </ItemGroup>
+
+</Project>

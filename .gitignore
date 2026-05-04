@@ -10,6 +10,8 @@ build/
 # .NET
 dotnet-helper/bin/
 dotnet-helper/obj/
+dotnet-helper-v2/bin/
+dotnet-helper-v2/obj/
 
 # IDE
 .idea/

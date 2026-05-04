@@ -603,6 +603,30 @@ namespace MatchPdt.Helper.Services
                     return dm;
                 }
 
+                // Diagnostic: what DMs already exist on this newly-created block?
+                var existingDms = ListExistingDms(block.OwnerId);
+                Program.WriteLog($"Block {block.Name} has {existingDms.Count} existing DMs: " +
+                    string.Join(", ", existingDms.Select(d => $"bit{d.bit}={d.name}")));
+
+                // If a DM exists at the target bit, rename it instead of adding a 9th —
+                // PDT compile expects every block.TDetectionMethod to have a matching
+                // TErrorTemplate.Error entry by bit position.
+                var existingAtBit = FindExistingDmAtBit(block.OwnerId, input.Bit);
+                if (existingAtBit != null)
+                {
+                    Program.WriteLog(
+                        $"DM at bit {input.Bit} exists (Name={GetStringProp(existingAtBit, "Name")}, " +
+                        $"Detection={GetStringProp(existingAtBit, "Detection")}); " +
+                        $"renaming to '{input.DmName}' instead of adding a duplicate");
+                    TrySetOnAny(existingAtBit, "Name", input.DmName);
+                    TrySetOnAny(existingAtBit, "Detection", input.DmName);
+                    TrySetOnAny(existingAtBit, "CustomName", input.DmName);
+                    TrySetOnAny(existingAtBit, "Description", input.Description);
+                    TrySetOnAny(existingAtBit, "DefaultFmi", input.FmiByte);
+                    TrySetOnAny(existingAtBit, "DefaultFmiEx", input.FmiExByte);
+                    return existingAtBit;
+                }
+
                 Program.WriteLog($"DM '{input.DmName}' not found — creating via ITRepository.NewDetectionMethod");
 
                 // ITRepository.NewDetectionMethod(ITBlock, IHymlError) creates the
@@ -656,6 +680,77 @@ namespace MatchPdt.Helper.Services
             ///     .ErrorTemplates (IList&lt;TErrorTemplate&gt;)
             ///     .DetectionMethods (IList&lt;TDetectionMethodTemplate&gt;)
             /// </summary>
+            /// <summary>
+            /// Walk the raw ITBlock.TDetectionMethods collection (NOT the
+            /// IDetectionMethodLoader.GetEnabledByBlockId filtered view, which only
+            /// returns "active" DMs and skips structural slots). Newly-created blocks
+            /// already carry 8 structural DM slots from the KB blueprint named
+            /// DM_ERR_00..07; those don't show up as "enabled" until they're tied to
+            /// errors, but they DO occupy bit positions and PDT compile rejects
+            /// duplicate bits.
+            /// </summary>
+            private IEnumerable EnumerateBlockTDetectionMethods(Guid blockId)
+            {
+                var businessIfaces = Assembly.Load("Hydac.PDT.Business.Interfaces");
+                var blockLoaderType = businessIfaces.GetType(
+                    "Hydac.PDT.Business.Contracts.Block.IBlockLoader", throwOnError: true)!;
+                var blockLoader = HostBootstrap.ResolveByReflection(blockLoaderType);
+                if (blockLoader == null) return Array.Empty<object>();
+                var itBlock = blockLoader.GetType().GetMethod("GetTBlockById", new[] { typeof(Guid) })?
+                    .Invoke(blockLoader, new object[] { blockId });
+                if (itBlock == null) return Array.Empty<object>();
+                var dms = itBlock.GetType().GetProperty("TDetectionMethods")?.GetValue(itBlock) as IEnumerable;
+                return dms ?? Array.Empty<object>();
+            }
+
+            private List<(int bit, string? name)> ListExistingDms(Guid blockId)
+            {
+                var result = new List<(int bit, string? name)>();
+                foreach (var dm in EnumerateBlockTDetectionMethods(blockId))
+                {
+                    if (dm == null) continue;
+                    var bitVal = dm.GetType().GetProperty("Bit")?.GetValue(dm);
+                    int bitInt;
+                    try { bitInt = Convert.ToInt32(bitVal); } catch { bitInt = -1; }
+                    var name = dm.GetType().GetProperty("Name")?.GetValue(dm) as string;
+                    result.Add((bitInt, name));
+                }
+                return result;
+            }
+
+            private object? FindExistingDmAtBit(Guid blockId, int bit)
+            {
+                foreach (var dm in EnumerateBlockTDetectionMethods(blockId))
+                {
+                    if (dm == null) continue;
+                    var dmBit = dm.GetType().GetProperty("Bit")?.GetValue(dm);
+                    if (dmBit == null) continue;
+                    int asInt;
+                    try { asInt = Convert.ToInt32(dmBit); } catch { continue; }
+                    if (asInt == bit) return dm;
+                }
+                return null;
+            }
+
+            private static string? GetStringProp(object obj, string name)
+                => obj.GetType().GetProperty(name)?.GetValue(obj) as string;
+
+            private static void TrySetOnAny(object obj, string name, object? value)
+            {
+                try
+                {
+                    var p = obj.GetType().GetProperty(name);
+                    if (p == null || !p.CanWrite || value == null) return;
+                    var target = Nullable.GetUnderlyingType(p.PropertyType) ?? p.PropertyType;
+                    if (!target.IsInstanceOfType(value))
+                    {
+                        try { value = Convert.ChangeType(value, target); } catch { }
+                    }
+                    p.SetValue(obj, value);
+                }
+                catch { /* ignore */ }
+            }
+
             public void LinkBlockToTemplate(BlockHandle block, Input input)
             {
                 try

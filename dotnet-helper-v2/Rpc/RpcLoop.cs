@@ -67,9 +67,8 @@ namespace MatchPdt.Helper.Rpc
                     "shutdown"         => RpcResponse.Ok(req.Id, "ok"),
                     "save_project"     => SaveProject(req),
                     "add_custom_error" => Services.ErrorService.AddCustomError(_host, req),
+                    "add_can_message"  => Services.CanMessageService.AddCanMessage(_host, req),
                     "probe_type"       => ProbeType(req),
-
-                    // Phase 3+: "add_can_message" => Services.CanMessageService.Add(_host, req),
 
                     _ => RpcResponse.Fail(req.Id, RpcErrorCodes.MethodNotFound, req.Method),
                 };

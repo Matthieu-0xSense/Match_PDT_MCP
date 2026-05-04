@@ -95,9 +95,26 @@ Highest-value migration target. Most complex Python implementation, cleanest ser
 - The "auto-discover sibling project for ERR block" Python hack disappears.
 
 ### Phase 3 — `add_can_message`
-- Resolve: `MessageService`, `SignalService`, `CanMessageLifeCycleManager`, `CanMessageNameAndIdGenerator`, `ICanMessageEcuLinkService`.
-- Use `SignalService.GetLastFreeStartBit(Guid)` for auto-placement (new feature unlocked by migration).
-- "Usage=None must be set in PDT" caveat goes away.
+
+**Service map (verified via dnSpy):**
+
+| v1 file mutation | v2 service call |
+|---|---|
+| `CanMessages.xml` — message entry | `ICanMessageRepository.Add(new CanMessage { … })` |
+| `CanMessageEcuLinks.xml` — ECU link entry | `ICanMessageEcuLinkRepository.Add(new CanMessageEcuLink { … })` (verify name) |
+| `CanSignals.xml` — signal entries | `ICanSignalRepository.Add(new CanSignal { … })` (verify) |
+| **"Usage=None, set in PDT manually"** caveat | `ICanMessageEcuLinkService.SetNewUsage(messageId, ecuLinkId, CanMessageEcuLinkUsage.TXC)` — this triggers CSND/CRCV block creation, exactly what the GUI does when the user toggles usage |
+| New feature unlocked | `ISignalService.GetLastFreeStartBit(Guid)` for auto-placement |
+
+`ICanMessageLifeCycleManager` only handles `DeleteMessage(Guid)` — creation goes through the repository directly. `IMessageService` (already a Phase 1 smoke-test target) provides the property setters: `SetCanId`, `SetCycleTime`, `SetDlc`, `SetByteOrder`, `SetType`, `SetSendInverseMessage`, etc. — those mirror the v1 `_build_message_element` field set 1:1.
+
+**Persistence pipeline:** same shape as Phase 2's Errors.dat. Expect `ProjectAgent.Save` to skip CanMessages.xml in headless flows; mirror the `WriteErrorsDat` pattern with whatever the equivalent `ISaveCanMessagesToDataLayer` (or similar — verify) is, so the snapshot-merge step can drop CanMessages.xml/CanSignals.xml from its carry-forward set.
+
+**Verify before implementing:**
+- The `CanMessage` and `CanSignal` model types in `Hydac.PDT.Can.Business.Contracts.Model` — what's required to construct one?
+- The repository for ECU links — exact interface name and Add signature.
+- The save-time persistence type for CAN messages (we likely need to invoke it directly post-Save, like `ISaveErrorsToDataLayer`).
+- Whether `IMessageService.SetType(...)` accepts `CanMessageType.None` so we can reproduce the v1 behavior of "create with no usage" if the user wants to defer block creation.
 
 ### Phase 4 — DB variable CRUD
 - Resolve: `DatabaseListService`, `DatabaseVariableService`, `DatabaseVariableLinkUpdater`, `DatabaseVariableIndexUpdater`, `DatabaseVariableRepositoryQuery`.

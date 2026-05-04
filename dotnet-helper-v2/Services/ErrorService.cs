@@ -107,6 +107,15 @@ namespace MatchPdt.Helper.Services
                 var newError = ctx.CreateAndAddError(block.OwnerId, (uint)input.Spn, hymlError, detectionMethod);
 
                 ApplyOverrides(newError, input);
+
+                // Critical for PDT compile: the block must appear in some
+                // TErrorTemplate.LinkedBlockIds, and a TDetectionMethodTemplate must
+                // exist in customDMs for the new DM. PDT's contract surface is read-
+                // only here (IDetectionMethodTemplateRepository has Find/GetAll only),
+                // so navigate the concrete project.dat structure via reflection — same
+                // path PDT's internal "Manage Error Templates" GUI mutates.
+                ctx.LinkBlockToTemplate(block, input);
+
                 host.SaveProject();
 
                 return RpcResponse.Ok(req.Id, BuildSuccessResult(newError, block, input, createdNewBlock));
@@ -634,6 +643,246 @@ namespace MatchPdt.Helper.Services
                     "Detection method created via NewDetectionMethod but GetByDefinition still " +
                     "returns null. Likely Name didn't stick or the block-loader's name lookup " +
                     "doesn't yet resolve. TDetectionMethod type: " + tDm.GetType().FullName);
+            }
+
+            /// <summary>
+            /// Add the block to a customTemplate's LinkedBlockIds list and create the
+            /// matching TDetectionMethodTemplate in customDMs. PDT crashes on compile if
+            /// these aren't set. The contract layer (IDetectionMethodTemplateRepository)
+            /// is read-only; PDT itself uses reflection on the concrete TErrorTemplate
+            /// collection. Path:
+            ///   projectAgent.Repository.RepoProject.Detail.DetectionMethodData
+            ///     .Custom (concrete IDetectionMethodSet)
+            ///     .ErrorTemplates (IList&lt;TErrorTemplate&gt;)
+            ///     .DetectionMethods (IList&lt;TDetectionMethodTemplate&gt;)
+            /// </summary>
+            public void LinkBlockToTemplate(BlockHandle block, Input input)
+            {
+                try
+                {
+                    var customSet = NavigateToCustomSet();
+                    if (customSet == null)
+                    {
+                        Program.WriteLog("LinkBlockToTemplate: could not navigate to customSet — skipping");
+                        return;
+                    }
+
+                    var customTemplates = (IList?)customSet.GetType().GetProperty("ErrorTemplates")?.GetValue(customSet);
+                    var customDms = (IList?)customSet.GetType().GetProperty("DetectionMethods")?.GetValue(customSet);
+                    if (customTemplates == null)
+                    {
+                        Program.WriteLog("LinkBlockToTemplate: ErrorTemplates property missing on customSet");
+                        return;
+                    }
+
+                    var templateName = string.IsNullOrEmpty(input.Template) ? input.BlockName : input.Template;
+                    var template = FindOrCreateTemplate(customTemplates, templateName);
+                    if (template == null)
+                    {
+                        Program.WriteLog("LinkBlockToTemplate: failed to find/create TErrorTemplate");
+                        return;
+                    }
+
+                    AddBlockGuidToLinkedBlockIds(template, block.OwnerId);
+                    AddDmTemplateToCustomDms(customDms, template, input);
+
+                    Program.WriteLog(
+                        $"Linked block {block.Name} to template '{templateName}' " +
+                        $"(LinkedBlockIds += {block.OwnerId}, customDM += {input.DmName})");
+                }
+                catch (Exception ex)
+                {
+                    Program.WriteLog($"LinkBlockToTemplate failed (non-fatal): {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+
+            private object? NavigateToCustomSet()
+            {
+                // ProjectAgent → Repository → RepoProject → Detail → DetectionMethodData → Custom
+                var repository = ProjectAgent.GetType().GetProperty("Repository")!.GetValue(ProjectAgent);
+                if (repository == null) return null;
+                var repoProject = repository.GetType().GetProperty("RepoProject")?.GetValue(repository);
+                if (repoProject == null) return null;
+                var detail = repoProject.GetType().GetProperty("Detail")?.GetValue(repoProject);
+                if (detail == null) return null;
+                var dmData = detail.GetType().GetProperty("DetectionMethodData")?.GetValue(detail);
+                if (dmData == null) return null;
+                // Custom is a concrete property exposing the customDMs/customTemplates set.
+                return dmData.GetType().GetProperty("Custom")?.GetValue(dmData);
+            }
+
+            private object? FindOrCreateTemplate(IList customTemplates, string templateName)
+            {
+                // 1. Find by Type matching templateName.
+                object? sourceTemplate = null;
+                foreach (var t in customTemplates)
+                {
+                    if (t == null) continue;
+                    if (sourceTemplate == null) sourceTemplate = t; // first valid for cloning
+                    var type = t.GetType().GetProperty("Type")?.GetValue(t) as string;
+                    if (string.Equals(type, templateName, StringComparison.OrdinalIgnoreCase))
+                        return t;
+                }
+
+                // 2. Not found — create. Need the element type of the collection.
+                Type templateType;
+                if (sourceTemplate != null)
+                    templateType = sourceTemplate.GetType();
+                else if (customTemplates.GetType().IsGenericType)
+                    templateType = customTemplates.GetType().GetGenericArguments()[0];
+                else
+                {
+                    Program.WriteLog("Cannot determine TErrorTemplate type (empty collection, non-generic list)");
+                    return null;
+                }
+
+                object? newTemplate;
+                try { newTemplate = Activator.CreateInstance(templateType); }
+                catch
+                {
+                    newTemplate = System.Runtime.Serialization.FormatterServices.GetUninitializedObject(templateType);
+                }
+                if (newTemplate == null) return null;
+
+                // 3. Copy non-collection properties from source if available.
+                if (sourceTemplate != null)
+                {
+                    foreach (var prop in templateType.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                    {
+                        if (!prop.CanRead || !prop.CanWrite || prop.GetIndexParameters().Length > 0) continue;
+                        if (prop.Name is "Error" or "LinkedBlockIds" or "LinkedBlocks") continue;
+                        try { prop.SetValue(newTemplate, prop.GetValue(sourceTemplate)); } catch { /* ignore */ }
+                    }
+                }
+
+                // 4. Set identity fields.
+                var tmplGuid = Guid.NewGuid().ToString();
+                TrySet(newTemplate, "Type", templateName);
+                TrySet(newTemplate, "Name", templateName);
+                TrySet(newTemplate, "ObjectId", tmplGuid);
+                TrySet(newTemplate, "GUID", tmplGuid);
+                TrySet(newTemplate, "Description", "");
+                TrySet(newTemplate, "PinType", "DEFAULT");
+
+                // 5. Initialize LinkedBlockIds (empty ObservableCollection<Guid>).
+                var linkedIdsType = sourceTemplate != null
+                    ? (templateType.GetProperty("LinkedBlockIds")?.PropertyType ?? typeof(System.Collections.ObjectModel.ObservableCollection<Guid>))
+                    : typeof(System.Collections.ObjectModel.ObservableCollection<Guid>);
+                if (linkedIdsType.IsInterface || linkedIdsType.IsAbstract)
+                    linkedIdsType = typeof(System.Collections.ObjectModel.ObservableCollection<Guid>);
+                try
+                {
+                    var newLinkedIds = Activator.CreateInstance(linkedIdsType);
+                    TrySet(newTemplate, "LinkedBlockIds", newLinkedIds);
+                }
+                catch (Exception ex)
+                {
+                    Program.WriteLog($"Couldn't init LinkedBlockIds: {ex.Message}");
+                }
+
+                // 6. Initialize Error list (TDetectionMethodErrorBase entries).
+                var errorPropType = templateType.GetProperty("Error")?.PropertyType;
+                if (errorPropType != null)
+                {
+                    try
+                    {
+                        var newErrorList = Activator.CreateInstance(errorPropType);
+                        TrySet(newTemplate, "Error", newErrorList);
+                    }
+                    catch { /* ignore */ }
+                }
+
+                customTemplates.Add(newTemplate);
+                Program.WriteLog($"Created new TErrorTemplate '{templateName}' (cloned from {(sourceTemplate != null ? "source" : "scratch")})");
+                return newTemplate;
+            }
+
+            private static void AddBlockGuidToLinkedBlockIds(object template, Guid blockId)
+            {
+                var linkedIds = template.GetType().GetProperty("LinkedBlockIds")?.GetValue(template) as IList;
+                if (linkedIds == null) return;
+                // Avoid duplicates.
+                foreach (var existing in linkedIds)
+                {
+                    if (existing is Guid g && g == blockId) return;
+                }
+                linkedIds.Add(blockId);
+            }
+
+            private static void AddDmTemplateToCustomDms(IList? customDms, object template, Input input)
+            {
+                if (customDms == null) return;
+
+                Type? dmTemplateType = customDms.GetType().IsGenericType
+                    ? customDms.GetType().GetGenericArguments()[0]
+                    : null;
+
+                // Also add to template.Error (TDetectionMethodErrorBase, a different type
+                // than customDms's TDetectionMethodTemplate).
+                var errorList = template.GetType().GetProperty("Error")?.GetValue(template) as IList;
+                Type? dmErrorBaseType = errorList?.GetType().IsGenericType == true
+                    ? errorList.GetType().GetGenericArguments()[0]
+                    : null;
+
+                if (dmErrorBaseType != null && errorList != null)
+                {
+                    object? entry;
+                    try { entry = Activator.CreateInstance(dmErrorBaseType); }
+                    catch { entry = System.Runtime.Serialization.FormatterServices.GetUninitializedObject(dmErrorBaseType); }
+                    if (entry != null)
+                    {
+                        TrySet(entry, "Bit", input.Bit);
+                        TrySet(entry, "DetectionMethodName", $"DM_ERR_{input.Bit:D2}");
+                        TrySet(entry, "Detection", input.DmName);
+                        TrySet(entry, "DetectionVm", input.DmName);
+                        TrySet(entry, "Description", input.Description);
+                        TrySet(entry, "DefaultFmi", input.FmiByte);
+                        TrySet(entry, "DefaultFmiEx", input.FmiExByte);
+                        TrySet(entry, "ObjectId", Guid.NewGuid().ToString());
+                        TrySet(entry, "GUID", Guid.NewGuid().ToString());
+                        errorList.Add(entry);
+                    }
+                }
+
+                if (dmTemplateType != null)
+                {
+                    object? dmTmpl;
+                    try { dmTmpl = Activator.CreateInstance(dmTemplateType); }
+                    catch { dmTmpl = System.Runtime.Serialization.FormatterServices.GetUninitializedObject(dmTemplateType); }
+                    if (dmTmpl != null)
+                    {
+                        TrySet(dmTmpl, "Bit", input.Bit);
+                        TrySet(dmTmpl, "DetectionMethodName", $"DM_ERR_{input.Bit:D2}");
+                        TrySet(dmTmpl, "Detection", input.DmName);
+                        TrySet(dmTmpl, "DetectionVm", input.DmName);
+                        TrySet(dmTmpl, "Description", input.Description);
+                        TrySet(dmTmpl, "DefaultFmi", input.FmiByte);
+                        TrySet(dmTmpl, "DefaultFmiEx", input.FmiExByte);
+                        TrySet(dmTmpl, "ObjectId", Guid.NewGuid().ToString());
+                        TrySet(dmTmpl, "GUID", Guid.NewGuid().ToString());
+                        customDms.Add(dmTmpl);
+                    }
+                }
+            }
+
+            private static void TrySet(object obj, string prop, object? value)
+            {
+                try
+                {
+                    var p = obj.GetType().GetProperty(prop);
+                    if (p == null || !p.CanWrite || value == null) return;
+                    // Coerce int→byte etc. when the property type is narrower than the
+                    // value we have. Without this, "Bit"/"DefaultFmi"/"DefaultFmiEx"
+                    // (byte properties) silently fail when we pass int.
+                    var target = Nullable.GetUnderlyingType(p.PropertyType) ?? p.PropertyType;
+                    if (!target.IsInstanceOfType(value))
+                    {
+                        try { value = Convert.ChangeType(value, target); }
+                        catch { /* fall through; SetValue will throw and be ignored */ }
+                    }
+                    p.SetValue(obj, value);
+                }
+                catch { /* property may not exist or be writable; ignore */ }
             }
 
             public object CreateAndAddError(Guid ownerId, uint spn, IHymlError hymlError, object detectionMethod)

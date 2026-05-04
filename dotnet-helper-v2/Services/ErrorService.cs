@@ -33,6 +33,44 @@ namespace MatchPdt.Helper.Services
     /// </summary>
     internal static class ErrorService
     {
+        public static List<object> DumpStandardBlockTypes()
+        {
+            try { return ProjectContext.Resolve().DumpStandardBlockTypes(); }
+            catch (Exception ex) { return new List<object> { new { error = $"{ex.GetType().Name}: {ex.Message}" } }; }
+        }
+
+        public static RpcResponse DeleteErrBlock(HostBootstrap host, RpcRequest req)
+        {
+            try
+            {
+                var blockName = req.GetStringParam("block_name");
+                if (string.IsNullOrEmpty(blockName))
+                    throw new ArgumentException("'block_name' is required");
+
+                var ctx = ProjectContext.Resolve();
+                var block = ctx.FindErrBlockByName(blockName)
+                    ?? throw new InvalidOperationException(
+                        $"ERR block '{blockName}' not found. Available: [{string.Join(", ", ctx.GetAllErrBlockNames())}]");
+
+                ctx.DeleteBlock(block);
+                host.SaveProject();
+
+                return RpcResponse.Ok(req.Id, new
+                {
+                    status = "ok",
+                    message = $"Deleted ERR block '{block.Name}'",
+                    block_name = block.Name,
+                    object_id = block.OwnerId.ToString(),
+                });
+            }
+            catch (Exception ex)
+            {
+                Program.WriteLog($"delete_err_block failed: {ex}");
+                return RpcResponse.Fail(req.Id, RpcErrorCodes.InternalError,
+                    $"{ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
         public static RpcResponse AddCustomError(HostBootstrap host, RpcRequest req)
         {
             try
@@ -278,40 +316,38 @@ namespace MatchPdt.Helper.Services
                 var factory = HostBootstrap.ResolveByReflection(factoryType)
                     ?? throw new InvalidOperationException("IErrorBlockFactory not registered");
 
-                // ownerId in IErrorBlockFactory.Create gets passed as Guid? to
-                // TBlockArguments. We try Guid.Empty first (interpreted as "no owner");
-                // if that fails the factory returns null and we fall back to scanning
-                // existing blocks for a blueprint candidate. The 6th param is described
-                // as "ownerId" in the decompiled source — it's the software-module or
-                // KB-blueprint association, not strictly required for ERR blocks.
-                var ownerCandidates = new[] {
-                    Guid.Empty,
-                    FindAnyErrBlockBlueprintGuid() ?? Guid.Empty,
-                };
+                // ownerId is the IHymlBlock blueprint GUID — without it the new block
+                // has no template binding and PDT can't populate Block Behavior init,
+                // Block-Description defaults, or the standard 8 default error definitions.
+                // Source: IKnowledgebaseAgent.GetStandardBlockTypes(virtualEcu) gives all
+                // block-type blueprints; filter Type=="ERR", call Item(ecu).Active(ecu)
+                // to get the IHymlBlock, then read its IHymlBase.GUID.
+                var blueprintGuid = FindErrBlueprintGuid()
+                    ?? FindAnyErrBlockBlueprintGuid()
+                    ?? Guid.Empty;
+                Program.WriteLog(
+                    $"IErrorBlockFactory.Create(ecuId={VirtualEcuId}, type=ERR, name={instanceName}, " +
+                    $"createErrors=true, initErrorDefs=true, blueprintGuid={blueprintGuid})");
 
                 var createMethod = factoryType.GetMethod("Create",
                     new[] { typeof(Guid), typeof(string), typeof(string),
                             typeof(bool), typeof(bool), typeof(Guid) })!;
 
-                object? itBlock = null;
-                foreach (var owner in ownerCandidates.Distinct())
+                object? itBlock;
+                try
                 {
-                    Program.WriteLog(
-                        $"IErrorBlockFactory.Create(ecuId={VirtualEcuId}, type=ERR, name={instanceName}, " +
-                        $"createErrors=true, initErrorDefs=true, owner={owner})");
-                    try
-                    {
-                        itBlock = createMethod.Invoke(factory,
-                            new object[] { VirtualEcuId, "ERR", instanceName, true, true, owner });
-                        if (itBlock != null) break;
-                        Program.WriteLog($"  → returned null with owner={owner}");
-                    }
-                    catch (TargetInvocationException tie) when (tie.InnerException is not null)
-                    {
-                        Program.WriteLog($"  → threw {tie.InnerException.GetType().Name}: {tie.InnerException.Message}");
-                    }
+                    itBlock = createMethod.Invoke(factory,
+                        new object[] { VirtualEcuId, "ERR", instanceName, true, true, blueprintGuid });
                 }
-                if (itBlock == null) return null;
+                catch (TargetInvocationException tie) when (tie.InnerException is not null)
+                {
+                    throw tie.InnerException;
+                }
+                if (itBlock == null)
+                {
+                    Program.WriteLog($"IErrorBlockFactory.Create returned null with blueprint {blueprintGuid}");
+                    return null;
+                }
 
                 // ITBlock has ObjectId (Guid) and Name (string) like the building blocks.
                 var id = (Guid?)itBlock.GetType().GetProperty("ObjectId")?.GetValue(itBlock);
@@ -322,6 +358,126 @@ namespace MatchPdt.Helper.Services
                 // blocks live on a different property than the Description we pass here
                 // (which is the error template's Description); leave as-is for now.
                 return new BlockHandle { Block = itBlock, OwnerId = id.Value, Name = name };
+            }
+
+            /// <summary>
+            /// Walk IKnowledgebaseAgent.GetStandardBlockTypes(virtualEcu) → look for
+            /// Type=="ERR" → IVirtualBlockBlueprint.Item(ecu) → IBlockBlueprint.Active(ecu)
+            /// → IHymlBlock → IHymlBase.GUID. That GUID is the ownerId
+            /// IErrorBlockFactory.Create needs to bind the new block to the KB template.
+            /// </summary>
+            private Guid? FindErrBlueprintGuid()
+            {
+                try
+                {
+                    var kb = ProjectAgent.GetType().GetProperty("KnowledgebaseAgent")?.GetValue(ProjectAgent);
+                    if (kb == null) return null;
+
+                    var virtualEcus = (IEnumerable)ProjectAgent.GetType().GetProperty("VirtualEcus")!.GetValue(ProjectAgent)!;
+                    var ecu = virtualEcus.Cast<object>().FirstOrDefault();
+                    if (ecu == null) return null;
+
+                    // KnowledgebaseAgent uses explicit interface implementation, so the
+                    // method isn't on the concrete type's public surface — go via the
+                    // IKnowledgebaseAgent interface type itself.
+                    var businessIfaces = Assembly.Load("Hydac.PDT.Business.Interfaces");
+                    var kbIface = businessIfaces.GetType(
+                        "Hydac.PDT.Business.Knowledgebase.IKnowledgebaseAgent", throwOnError: true)!;
+                    var getStandard = kbIface.GetMethod("GetStandardBlockTypes");
+                    if (getStandard == null) return null;
+
+                    // Same explicit-interface-impl pattern as KnowledgebaseAgent: get the
+                    // Item indexer + Active method off the interfaces, not the concrete.
+                    var virtualBpIface = businessIfaces.GetType(
+                        "Hydac.PDT.Business.IVirtualBlockBlueprint", throwOnError: true)!;
+                    var blockBpIface = businessIfaces.GetType(
+                        "Hydac.PDT.Business.Knowledgebase.IBlockBlueprint", throwOnError: true)!;
+                    var virtualEcuIface = businessIfaces.GetType(
+                        "Hydac.PDT.Business.IVirtualEcu", throwOnError: true)!;
+                    var typeProp = virtualBpIface.GetProperty("Type")!;
+                    var itemMethod = virtualBpIface.GetMethods()
+                        .First(m => m.Name == "get_Item" && m.GetParameters().Length == 1
+                            && m.GetParameters()[0].ParameterType == virtualEcuIface);
+                    var activeMethod = blockBpIface.GetMethods()
+                        .First(m => m.Name == "Active" && m.GetParameters().Length == 1
+                            && m.GetParameters()[0].ParameterType == virtualEcuIface);
+
+                    var blueprints = (IEnumerable)getStandard.Invoke(kb, new[] { ecu })!;
+                    foreach (var bp in blueprints)
+                    {
+                        var type = (string?)typeProp.GetValue(bp);
+                        if (!string.Equals(type, "ERR", StringComparison.OrdinalIgnoreCase)) continue;
+
+                        var blockBlueprint = itemMethod.Invoke(bp, new[] { ecu });
+                        if (blockBlueprint == null) continue;
+                        var hymlBlock = activeMethod.Invoke(blockBlueprint, new[] { ecu });
+                        if (hymlBlock == null) continue;
+
+                        // IHymlBlock inherits IHymlBase which exposes GUID. Use the IHymlBase
+                        // interface to get the property since the concrete class might use
+                        // explicit interface implementation here too.
+                        var hymlBaseIface = Assembly.Load("Hydac.MATCH.HyML.Contract").GetType(
+                            "Hydac.MATCH.HyML.Contract.Interfaces.IHymlBase", throwOnError: true)!;
+                        var guidProp = hymlBaseIface.GetProperty("GUID");
+                        var guid = guidProp?.GetValue(hymlBlock) as Guid?;
+                        if (guid is { } g && g != Guid.Empty)
+                        {
+                            Program.WriteLog($"Found ERR blueprint GUID {g} via IKnowledgebaseAgent.GetStandardBlockTypes");
+                            return g;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Program.WriteLog($"FindErrBlueprintGuid warning (non-fatal): {ex.GetType().Name}: {ex.Message}");
+                }
+                return null;
+            }
+
+            /// <summary>
+            /// Diagnostic helper: dump all standard block-type blueprints visible to the
+            /// first VirtualEcu so we can see the actual Type strings, blueprint shapes,
+            /// and where the ERR template should be.
+            /// </summary>
+            public List<object> DumpStandardBlockTypes()
+            {
+                var result = new List<object>();
+                try
+                {
+                    var kb = ProjectAgent.GetType().GetProperty("KnowledgebaseAgent")?.GetValue(ProjectAgent);
+                    if (kb == null)
+                    {
+                        result.Add(new { error = "KnowledgebaseAgent property is null" });
+                        return result;
+                    }
+                    var virtualEcus = (IEnumerable)ProjectAgent.GetType().GetProperty("VirtualEcus")!.GetValue(ProjectAgent)!;
+                    var ecu = virtualEcus.Cast<object>().FirstOrDefault();
+                    if (ecu == null)
+                    {
+                        result.Add(new { error = "no VirtualEcus" });
+                        return result;
+                    }
+                    var businessIfaces = Assembly.Load("Hydac.PDT.Business.Interfaces");
+                    var kbIface = businessIfaces.GetType(
+                        "Hydac.PDT.Business.Knowledgebase.IKnowledgebaseAgent", throwOnError: true)!;
+                    var getStandard = kbIface.GetMethod("GetStandardBlockTypes");
+                    if (getStandard == null)
+                    {
+                        result.Add(new { error = "GetStandardBlockTypes not found on IKnowledgebaseAgent" });
+                        return result;
+                    }
+                    var blueprints = (IEnumerable)getStandard.Invoke(kb, new[] { ecu })!;
+                    foreach (var bp in blueprints)
+                    {
+                        var t = (string?)bp.GetType().GetProperty("Type")?.GetValue(bp);
+                        result.Add(new { type = t, bp_type = bp.GetType().FullName });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    result.Add(new { error = $"{ex.GetType().Name}: {ex.Message}" });
+                }
+                return result;
             }
 
             private Guid? FindAnyErrBlockBlueprintGuid()
@@ -372,6 +528,47 @@ namespace MatchPdt.Helper.Services
             {
                 var getByType = BlockRepository.GetType().GetMethod("GetByType", new[] { typeof(string) })!;
                 return (IEnumerable)getByType.Invoke(BlockRepository, new object[] { "ERR" })!;
+            }
+
+            /// <summary>
+            /// Delete a block + all its associated errors. v1's IBlockLifecycleManager
+            /// .DeleteAndLog handles the full cascade (errors, DMs, error-block links).
+            /// </summary>
+            public void DeleteBlock(BlockHandle block)
+            {
+                var businessIfaces = Assembly.Load("Hydac.PDT.Business.Interfaces");
+                var lifecycleType = businessIfaces.GetType(
+                    "Hydac.PDT.Business.Block.IBlockLifecycleManager", throwOnError: false);
+                if (lifecycleType != null)
+                {
+                    var lifecycle = HostBootstrap.ResolveByReflection(lifecycleType);
+                    if (lifecycle != null)
+                    {
+                        var deleteAndLog = lifecycle.GetType().GetMethod("DeleteAndLog");
+                        if (deleteAndLog != null)
+                        {
+                            try
+                            {
+                                deleteAndLog.Invoke(lifecycle, new object[] { block.OwnerId, block.Name });
+                                Program.WriteLog($"Deleted block '{block.Name}' via IBlockLifecycleManager.DeleteAndLog");
+                                return;
+                            }
+                            catch (TargetInvocationException tie) when (tie.InnerException is not null)
+                            {
+                                Program.WriteLog($"DeleteAndLog failed: {tie.InnerException.Message}; falling back to BlockRepository.Remove");
+                            }
+                        }
+                    }
+                }
+
+                // Fallback: direct repository removal — won't cascade error cleanup,
+                // but it's better than nothing if the lifecycle manager isn't bound.
+                BlockRepository.GetType()
+                    .GetMethods()
+                    .First(m => m.Name == "Remove" && m.GetParameters().Length == 1
+                        && m.GetParameters()[0].ParameterType == typeof(Guid))
+                    .Invoke(BlockRepository, new object[] { block.OwnerId });
+                Program.WriteLog($"Deleted block '{block.Name}' via IBlockRepository.Remove (fallback, no error cascade)");
             }
 
             public object FindOrCreateDetectionMethod(BlockHandle block, Input input, IHymlError hymlError)

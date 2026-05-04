@@ -271,6 +271,10 @@ Solution (in `HostBootstrap.WriteErrorsDat`): after `IProjectAgent.Save`, resolv
 
 The other lazy-loaded sub-systems (`HymlEcuTemplates.xml`, `CanMessages.xml`, `DatabaseLists.xml`, …) still rely on the snapshot carry-forward — their persistence pipelines will need similar wiring per phase (CAN messages in Phase 3, DB variables in Phase 4).
 
+### Template linking is mandatory for compile
+
+User-confirmed: without a `customTemplates.ErrorTemplates[].LinkedBlockIds` entry pointing at the new block, PDT crashes on compile. So this isn't optional — it's required for any add_custom_error path that creates a new block.
+
 ### No higher-level service for project.dat customTemplates
 
 Investigated whether a PDT service maintains `customTemplates.ErrorTemplates[].LinkedBlockIds` automatically when an error is added. **It doesn't.** Findings:
@@ -279,12 +283,34 @@ Investigated whether a PDT service maintains `customTemplates.ErrorTemplates[].L
 - `DetectionMethodLinkObserver` — only raises a `BlockLoaderSourcesChanged` event when a block is added, doesn't mutate template-side state.
 - `IDetectionMethodTemplate` (the contract abstraction over `TErrorTemplate`) — exposes only `DefaultFmi`, `DefaultFmiEx`, `Description`. Not `LinkedBlockIds`.
 - The template-level fields in project.dat (Type, LinkedBlockIds, customDM template entries) are maintained by separate UI flows (template creation dialogs), not by the add-error flow.
+- `IDetectionMethodTemplateRepository` (the contract over `customTemplates`) is read-only: `Find(blockName, dmName, bit)`, `Find(IDetectionMethod)`, `GetAll()`. No `Add`/`Create` method.
 
 So those last-mile fields require either:
 - v1-style reflection on `DataLayer.Repo.RepoProject.Detail.DetectionMethodData.Custom` paths, OR
 - A separate "create_template" verb that the caller runs before add_custom_error when a new template is needed.
 
-The v1 reflection is the simpler path — port that block of code into v2. The custom-template creation is a per-template concern, not per-error, and could be a separate verb.
+**The v1 reflection is the canonical path.** PDT itself uses internal reflection on the concrete `TErrorTemplate` collection — there is no public service surface for template mutation. Porting v1's logic (lines 1402-1530 of `dotnet-helper/Program.cs`) is the right shape.
+
+### Template-link reflection path (for next implementation)
+
+Verified runtime path:
+```
+projectAgent (IProjectAgent)
+  .Repository (ITRepository)
+  .RepoProject (ITProject)
+  .Detail (ITProjectDetail)
+  .DetectionMethodData (IDetectionMethodData)
+  .CustomTemplateRepository (IDetectionMethodTemplateRepository)  ← contract, read-only
+```
+The concrete impl behind `CustomTemplateRepository` carries the underlying `IList<TErrorTemplate>` — that's what v1 mutates. Steps:
+1. Navigate to the concrete repository instance.
+2. Reflect a backing field or collection property to access the `TErrorTemplate` list.
+3. Find a `TErrorTemplate` where `Type == input.Template` (or fall back to any existing one if the project has no custom templates yet — many projects ship with at least one).
+4. If none found and we need to create one: clone shape from a default-template entry, set `Type = input.Template`, fresh `LinkedBlockIds`, `Error` list, etc. (v1's lines 1439-1530).
+5. Append `block.OwnerId` to the chosen template's `LinkedBlockIds` list.
+6. Save normally — the change rides through `IProjectAgent.Save` because it's in the project's data tree.
+
+Also required for compile per user feedback: block-level `TBlockParam` with `ConnectedBlockType=="ERR"` must reflect the actual error count (increment on add). Same project.dat mutation pattern.
 
 ### Known gaps (from PDT GUI verification)
 

@@ -40,11 +40,25 @@ namespace MatchPdt.Helper.Services
                 var input = ParseInput(req);
                 var ctx = ProjectContext.Resolve();
 
-                var block = ctx.FindErrBlockByName(input.BlockName)
-                    ?? throw new InvalidOperationException(
-                        $"ERR block '{input.BlockName}' not found in project. " +
-                        $"Available ERR blocks: [{string.Join(", ", ctx.GetAllErrBlockNames())}]. " +
-                        $"Creating new blocks is not yet supported in v2 — use v1 for that path.");
+                var existing = ctx.FindErrBlockByName(input.BlockName);
+                bool createdNewBlock = false;
+                BlockHandle block;
+                if (existing != null)
+                {
+                    block = existing;
+                }
+                else
+                {
+                    // No matching ERR block — create one via IErrorBlockFactory.Create
+                    // (which goes through ICreateBlockCommand.Execute, the same path as
+                    // PDT GUI's File→Create Block).
+                    block = ctx.CreateNewErrBlock(input.BlockName, input.Description)
+                        ?? throw new InvalidOperationException(
+                            $"Failed to create ERR block '{input.BlockName}'. " +
+                            $"Existing ERR blocks: [{string.Join(", ", ctx.GetAllErrBlockNames())}]");
+                    createdNewBlock = true;
+                    Program.WriteLog($"Created new ERR block {input.BlockName} ({block.OwnerId})");
+                }
 
                 EnsureSpnUnique(ctx, input.Spn);
                 EnsureDmNameUnique(ctx, input.DmName);
@@ -57,7 +71,7 @@ namespace MatchPdt.Helper.Services
                 ApplyOverrides(newError, input);
                 host.SaveProject();
 
-                return RpcResponse.Ok(req.Id, BuildSuccessResult(newError, block, input));
+                return RpcResponse.Ok(req.Id, BuildSuccessResult(newError, block, input, createdNewBlock));
             }
             catch (Exception ex)
             {
@@ -249,6 +263,102 @@ namespace MatchPdt.Helper.Services
                 return null;
             }
 
+            /// <summary>
+            /// Create a new ERR block via IErrorBlockFactory.Create, which delegates to
+            /// ICreateBlockCommand.Execute — the same path GUI File→Create Block uses.
+            /// Needs an IHymlBlock blueprint Guid; we steal one from any existing ERR
+            /// block in the project (v1's "sibling project" hack disappears: any
+            /// in-project ERR block carries the same blueprint).
+            /// </summary>
+            public BlockHandle? CreateNewErrBlock(string instanceName, string description)
+            {
+                var businessIfaces = Assembly.Load("Hydac.PDT.Business.Interfaces");
+                var factoryType = businessIfaces.GetType(
+                    "Hydac.PDT.Business.Contracts.Errors.IErrorBlockFactory", throwOnError: true)!;
+                var factory = HostBootstrap.ResolveByReflection(factoryType)
+                    ?? throw new InvalidOperationException("IErrorBlockFactory not registered");
+
+                // ownerId in IErrorBlockFactory.Create gets passed as Guid? to
+                // TBlockArguments. We try Guid.Empty first (interpreted as "no owner");
+                // if that fails the factory returns null and we fall back to scanning
+                // existing blocks for a blueprint candidate. The 6th param is described
+                // as "ownerId" in the decompiled source — it's the software-module or
+                // KB-blueprint association, not strictly required for ERR blocks.
+                var ownerCandidates = new[] {
+                    Guid.Empty,
+                    FindAnyErrBlockBlueprintGuid() ?? Guid.Empty,
+                };
+
+                var createMethod = factoryType.GetMethod("Create",
+                    new[] { typeof(Guid), typeof(string), typeof(string),
+                            typeof(bool), typeof(bool), typeof(Guid) })!;
+
+                object? itBlock = null;
+                foreach (var owner in ownerCandidates.Distinct())
+                {
+                    Program.WriteLog(
+                        $"IErrorBlockFactory.Create(ecuId={VirtualEcuId}, type=ERR, name={instanceName}, " +
+                        $"createErrors=true, initErrorDefs=true, owner={owner})");
+                    try
+                    {
+                        itBlock = createMethod.Invoke(factory,
+                            new object[] { VirtualEcuId, "ERR", instanceName, true, true, owner });
+                        if (itBlock != null) break;
+                        Program.WriteLog($"  → returned null with owner={owner}");
+                    }
+                    catch (TargetInvocationException tie) when (tie.InnerException is not null)
+                    {
+                        Program.WriteLog($"  → threw {tie.InnerException.GetType().Name}: {tie.InnerException.Message}");
+                    }
+                }
+                if (itBlock == null) return null;
+
+                // ITBlock has ObjectId (Guid) and Name (string) like the building blocks.
+                var id = (Guid?)itBlock.GetType().GetProperty("ObjectId")?.GetValue(itBlock);
+                var name = (string?)itBlock.GetType().GetProperty("Name")?.GetValue(itBlock) ?? instanceName;
+                if (id == null || id.Value == Guid.Empty) return null;
+
+                // Set Description if the property exists. Block-level descriptions on ERR
+                // blocks live on a different property than the Description we pass here
+                // (which is the error template's Description); leave as-is for now.
+                return new BlockHandle { Block = itBlock, OwnerId = id.Value, Name = name };
+            }
+
+            private Guid? FindAnyErrBlockBlueprintGuid()
+            {
+                foreach (var block in EnumerateErrBlocks())
+                {
+                    // IBuildingBlock exposes BlockTemplate as IHymlBlock; IHymlBlock has a
+                    // Key/Guid we can use. The legacy property in v1 was "GUIDBlueprint";
+                    // try multiple candidates to handle either world.
+                    var candidate =
+                        TryGetGuidProp(block, "GUIDBlueprint")
+                        ?? TryGetGuidProp(block, "BlueprintId")
+                        ?? TryGetGuidPropOnNested(block, "BlockTemplate", "ObjectId")
+                        ?? TryGetGuidPropOnNested(block, "BlockTemplate", "Guid");
+                    if (candidate is { } g && g != Guid.Empty) return g;
+                }
+                return null;
+            }
+
+            private static Guid? TryGetGuidProp(object obj, string name)
+            {
+                var p = obj.GetType().GetProperty(name);
+                if (p == null) return null;
+                var v = p.GetValue(obj);
+                if (v is Guid g) return g;
+                if (v is string s && Guid.TryParse(s, out var gs)) return gs;
+                return null;
+            }
+
+            private static Guid? TryGetGuidPropOnNested(object obj, string parent, string child)
+            {
+                var p = obj.GetType().GetProperty(parent);
+                var nested = p?.GetValue(obj);
+                if (nested == null) return null;
+                return TryGetGuidProp(nested, child);
+            }
+
             public IEnumerable<string> GetAllErrBlockNames()
             {
                 foreach (var block in EnumerateErrBlocks())
@@ -403,22 +513,23 @@ namespace MatchPdt.Helper.Services
 
         // ---- Result shape (matches v1 contract) ------------------------------
 
-        private static object BuildSuccessResult(object error, BlockHandle block, Input input)
+        private static object BuildSuccessResult(object error, BlockHandle block, Input input, bool newBlock)
         {
             var errorId = (Guid?)error.GetType().GetProperty("ObjectId")?.GetValue(error);
             var dm = error.GetType().GetProperty("DetectionMethod")?.GetValue(error);
             var dmId = (Guid?)dm?.GetType().GetProperty("ObjectId")?.GetValue(dm);
+            var verb = newBlock ? "Created block and added error" : "Custom error added to block";
             return new
             {
                 status = "ok",
-                message = $"Custom error added to block '{block.Name}'.",
+                message = $"{verb} '{block.Name}'.",
                 spn = input.Spn,
                 dm_name = input.DmName,
                 dm_guid = dmId?.ToString() ?? "",
                 template = input.Template,
                 block_name = block.Name,
                 object_id = errorId?.ToString() ?? "",
-                new_block = false,
+                new_block = newBlock,
             };
         }
     }

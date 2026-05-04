@@ -220,6 +220,31 @@ Things the original plan got wrong, in order of how much pain they caused:
 - The `ConsoleWriterDialogServiceAdapter` registered by `CliSetup.RegisterCustomDependencies` writes dialog text to `Console.Out`, which is our JSON-RPC channel. server.py needs to drain stdout until the literal "Ready." line. Cleaner: register our own `IDialogServiceAdapter` via the customRegister callback that logs to stderr instead.
 - AssemblyVersion=99.99.99.0 will leak into project saves' `PdtVersionString`. Override `IApplicationVersionDetails` in Phase 2 (read the loaded `Hydac.PDT.PdtFramework.dll`'s file version and report that).
 
+## Phase 2 — partial: in-memory works, save round-trip fails
+
+**Status: WIP, gated behind `add_custom_error_experimental`. server.py must keep using v1 for `add_custom_error` until the save-corruption is fixed.**
+
+What works in `add_custom_error_experimental`:
+- v1 JSON contract (`template`, `dm_name`, `bit`, `spn`, `block_name`, `description`, `severity`, `fmi`, `fmi_extended`, `set/release_debounce_ms`, `set/release_threshold`) parsed and validated.
+- ERR block resolved by name via `IBlockRepository.GetByType("ERR")` then by `Name` match.
+- SPN + DM-name uniqueness verified against `IErrorCollection`.
+- TDetectionMethod created via `ITRepository.NewDetectionMethod(ITBlock, IHymlError)` (atomic: creates, links to block, registers in `Repository.DetectionMethods`).
+- Synthetic `IHymlError` (helper-internal `HymlErrorImpl`) carries the FMI/debounce values.
+- Error created via `IErrorBuilder.CreateError(Guid ownerId, uint spn, IHymlError, IDetectionMethod)` (private; invoked reflectively to bypass the redundant DM resolution in `CreateAndAddBuildingBlockError`).
+- Error added to project via `IProjectErrorFactory.AddToProject`.
+- Threshold/Description/Severity overrides applied post-creation.
+- `IProjectAgent.Save(string)` called; the resulting HDB is written without exception.
+- v1-shaped success result returned: `{status, message, spn, dm_name, dm_guid, template, block_name, object_id, new_block}`.
+
+What's broken: re-loading the saved HDB fails with `"The given key was not present in the dictionary"` from `CliProjectCommands.LoadProjectAsync` → `MainVm.LoadProjectCommand`. The save itself doesn't throw, but some referenced-by-key state (likely a missing `Idx` on TDetectionMethod, a missing `IDetectionMethodTemplate` entry, or an unfilled FmiExt link) isn't filled in by `IErrorBuilder.CreateError` for the custom path. v1's CustomErrorAdd explicitly populated more fields (Idx, LinkedBlockIds, PinType, Type, GUID on the template object) — those still need to be reconciled with the new-world API surface.
+
+Resolved facts:
+- Concrete TDetectionMethod type used: `Hydac.PDT.ViewModel.TDetectionMethod`.
+- `IDetectionMethodFactory.Create(IHymlError)` returns a free-floating instance — does NOT register it into the project. Use `ITRepository.NewDetectionMethod(ITBlock, IHymlError)` instead.
+- `IDetectionMethodLoader.GetByDefinition` queries `_projectAgent.Repository.DetectionMethods` filtered by `BlockObjectId` then by `Name` (exact, case-sensitive). The DM's `Name` must be set explicitly after `NewDetectionMethod` because the factory uses `IHymlError.Detection`, not `Name`.
+- `IDtc.Fmi` / `IDtc.FmiEx` are `IFailureModeIdentifier` references, not byte. `DtcFactory.Create(spn, byte, byte)` resolves the bytes into the right instances; don't try to override post-creation as bytes.
+- `ITRepository` uses explicit interface implementation for several methods (incl. `NewDetectionMethod`) — `repo.GetType().GetMethods()` misses them; reflect off the interface type instead.
+
 ## Phase 2 — foundation in place, mapping pending
 
 What's landed (this commit):

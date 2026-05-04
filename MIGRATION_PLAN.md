@@ -220,9 +220,13 @@ Things the original plan got wrong, in order of how much pain they caused:
 - The `ConsoleWriterDialogServiceAdapter` registered by `CliSetup.RegisterCustomDependencies` writes dialog text to `Console.Out`, which is our JSON-RPC channel. server.py needs to drain stdout until the literal "Ready." line. Cleaner: register our own `IDialogServiceAdapter` via the customRegister callback that logs to stderr instead.
 - AssemblyVersion=99.99.99.0 will leak into project saves' `PdtVersionString`. Override `IApplicationVersionDetails` in Phase 2 (read the loaded `Hydac.PDT.PdtFramework.dll`'s file version and report that).
 
-## Phase 2 — partial: save round-trip works, error persistence partial
+## Phase 2 — `add_custom_error` ships in v2
 
-**Status: WIP, gated behind `add_custom_error_experimental`. server.py must keep using v1 for `add_custom_error` until full sub-manager wiring is in place.**
+**Status: end-to-end verified. The verb `add_custom_error` is un-gated; server.py can stop falling back to v1 once it's switched over.**
+
+Verified flow on `Project_Test_changed.hdb` (clean copy):
+- helper #1: `add_custom_error{ dm_name: "DM_PHASE2_FINAL", spn: 95000, … }` → `{status: ok, dm_guid, object_id}`. `Errors.dat` written with 76 errors (75 existing + 1 new).
+- helper #2 (fresh process): `add_custom_error{ dm_name: "DM_PHASE2_FINAL", spn: 95001, … }` → rejected with `ArgumentException: DM name 'DM_PHASE2_FINAL' already exists.` Proves the new error round-tripped through save + reload and is visible in `IErrorCollection`.
 
 ### Save fix (this commit)
 
@@ -242,14 +246,17 @@ Verified: clean Project_Test_changed.hdb (1.40 MB) → save_project → 1.61 MB 
 - **DM** created via `ITRepository.NewDetectionMethod` lives in `project.dat` / `Repository.DetectionMethods` — PDT writes project.dat back. After reload, `IDetectionMethodLoader.GetByDefinition` finds it.
 - **Error** created via `IErrorBuilder.CreateError` + `IProjectErrorFactory.AddToProject` lives in `Errors.dat` — which we carry forward from the pristine snapshot, so the **mutation is lost on save**. The DM exists post-reload; its error doesn't.
 
-### Next: force-load Errors sub-manager
+### Errors persistence (resolved)
 
-To make the error persist, we need the Errors sub-manager loaded BEFORE save, so `ProjectAgent.Save`'s persistence-adapter loop emits `Errors.dat` from the in-memory state. Likely entry points to investigate:
-- `Hydac.PDT.Errors.Business.Loader.LoadErrorsFromPersistence`
-- `Hydac.PDT.Errors.Business.Contracts.Loader.ILoadErrorsFromDataLayer`
-- Touching `IErrorCollection` (we already do — but the eager DataLayer-side load may need a separate trigger).
+`ProjectAgent.Save` doesn't emit `Errors.dat` because no errors-persistence adapter is registered for headless flows. But the project's existing 75 errors auto-populate into `IErrorCollection` during `CliInitialization.InitializeMain` via the LoadErrorsFromRepository fallback. So we don't need to load them — but we do need to write them.
 
-When that's done, the snapshot-merge step can be made conditional / removed for files that PDT now correctly writes back.
+Solution (in `HostBootstrap.WriteErrorsDat`): after `IProjectAgent.Save`, resolve `ISaveErrorsToDataLayer` and call `Save(IErrorCollection)`. That serializes the in-memory error list (existing + our newly-added) to `Errors.dat` inside the saved .hdb via BinaryFormatter. Runs BEFORE the snapshot-merge step so the merge sees `Errors.dat` already in place and skips it.
+
+The other lazy-loaded sub-systems (`HymlEcuTemplates.xml`, `CanMessages.xml`, `DatabaseLists.xml`, …) still rely on the snapshot carry-forward — their persistence pipelines will need similar wiring per phase (CAN messages in Phase 3, DB variables in Phase 4).
+
+### Other dup-check fix
+
+`IDetectionMethod` (the project-level model) exposes `Name`, not `Detection`. v1's CustomErrorAdd checked `TDetectionMethodTemplate.Detection` because that lived on a different layer (project.dat's customDMs collection). The v2 dup check now reads `dm.Name`.
 
 
 

@@ -365,12 +365,16 @@ namespace MatchPdt.Helper.Services
 
         private static void EnsureDmNameUnique(ProjectContext ctx, string dmName)
         {
+            // IDetectionMethod (the project-level model) exposes Name, not Detection. The
+            // v1 helper checked TDetectionMethodTemplate.Detection because that was the
+            // shape of project.dat's customDMs collection — different layer, different
+            // property.
             foreach (var err in ctx.ErrorsCollection)
             {
                 var dm = err.GetType().GetProperty("DetectionMethod")?.GetValue(err);
                 if (dm == null) continue;
-                var detection = (string?)dm.GetType().GetProperty("Detection")?.GetValue(dm);
-                if (string.Equals(detection, dmName, StringComparison.OrdinalIgnoreCase))
+                var name = (string?)dm.GetType().GetProperty("Name")?.GetValue(dm);
+                if (string.Equals(name, dmName, StringComparison.OrdinalIgnoreCase))
                     throw new ArgumentException($"DM name '{dmName}' already exists.");
             }
         }

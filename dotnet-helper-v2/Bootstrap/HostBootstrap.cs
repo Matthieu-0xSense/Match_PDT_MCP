@@ -189,6 +189,13 @@ namespace MatchPdt.Helper.Bootstrap
                 Program.WriteLog($"WaitForValidationToEndAsync warning (non-fatal): {ex.Message}");
             }
 
+            // IErrorCollection auto-populates with the project's existing errors during
+            // CliInitialization.InitializeMain (via the LoadErrorsFromRepository path).
+            // We previously tried to also call ILoadErrorsFromPersistence here, but the
+            // auto-load already produces a populated collection (~75 errors on the test
+            // project); manual loading would create duplicates and that interface lives
+            // in an internal namespace not exposed via Contracts anyway.
+
             return new HostBootstrap(
                 cliInitType,
                 project,
@@ -251,8 +258,44 @@ namespace MatchPdt.Helper.Bootstrap
                 throw tie.InnerException;
             }
 
+            // ProjectAgent.Save doesn't emit Errors.dat (no persistence adapter is wired
+            // for headless flows). Write it explicitly via ISaveErrorsToDataLayer, which
+            // serializes IErrorCollection → BinaryFormatter → Errors.dat in the saved
+            // .hdb. This must happen AFTER ProjectAgent.Save (which sets DataLayer
+            // .FileBackup to the saved .hdb path) and BEFORE the snapshot merge (so the
+            // merge sees Errors.dat as already-present and skips the stale carry-forward).
+            WriteErrorsDat();
+
             MergeMissingFilesFromSnapshot(HdbFile.FullName, PristineSnapshotPath);
             PatchInfoXmlVersion(HdbFile.FullName);
+        }
+
+        private void WriteErrorsDat()
+        {
+            try
+            {
+                var errorsContracts = Assembly.Load("Hydac.PDT.Errors.Business.Contracts");
+                var saveType = errorsContracts.GetType(
+                    "Hydac.PDT.Errors.Business.Contracts.Loader.ISaveErrorsToDataLayer",
+                    throwOnError: true)!;
+                var saver = ResolveByReflection(saveType)
+                    ?? throw new InvalidOperationException("ISaveErrorsToDataLayer not registered");
+
+                var collectionType = errorsContracts.GetType(
+                    "Hydac.PDT.Errors.Business.Contracts.IErrorCollection", throwOnError: true)!;
+                var collection = ResolveByReflection(collectionType)
+                    ?? throw new InvalidOperationException("IErrorCollection not registered");
+
+                var save = saveType.GetMethod("Save")!;
+                save.Invoke(saver, new[] { collection });
+
+                var count = ((System.Collections.IEnumerable)collection).Cast<object>().Count();
+                Program.WriteLog($"Wrote Errors.dat with {count} errors");
+            }
+            catch (Exception ex)
+            {
+                Program.WriteLog($"WriteErrorsDat warning (non-fatal): {ex.Message}");
+            }
         }
 
         /// <summary>

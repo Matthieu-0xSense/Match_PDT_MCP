@@ -115,10 +115,15 @@ def call(method: str, params: dict[str, Any] | None = None,
             raise HelperError("helper stdin/stdout unavailable")
         proc.stdin.write(json.dumps(req) + "\n")
         proc.stdin.flush()
-        line = proc.stdout.readline()
-
-    if not line:
-        raise HelperError("helper closed stdout unexpectedly")
+        # PDT's dialog adapter occasionally writes blank/non-JSON lines to stdout
+        # mid-session. Skip anything that doesn't start with '{'.
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                raise HelperError("helper closed stdout unexpectedly")
+            if line.lstrip().startswith("{"):
+                break
+            print(f"[helper_v2 skip] {line!r}", file=sys.stderr)
     try:
         resp = json.loads(line)
     except json.JSONDecodeError as e:

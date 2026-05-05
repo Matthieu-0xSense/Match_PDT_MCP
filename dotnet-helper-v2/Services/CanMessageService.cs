@@ -287,6 +287,12 @@ namespace MatchPdt.Helper.Services
 
                 Program.WriteLog($"add_can_message: created '{name}' (id={messageId}) on bus {busOneIndexed} ({busId}) with usage={direction}");
 
+                // Step 4: signals. Spec: "name:startbit:sizebits,name:startbit:sizebits,..."
+                // Each becomes a CanSignal owned by the message. Default DataType = TUINT8
+                // (matches v1's typical default — caller can override via data_type field
+                // when we expose it; out of scope for this minimal step).
+                var signalsResult = AddSignals(req, canContracts, businessIfaces, messageId);
+
                 host.SaveProject();
 
                 return RpcResponse.Ok(req.Id, new
@@ -299,7 +305,7 @@ namespace MatchPdt.Helper.Services
                     bus_id = busId.ToString(),
                     ecu_id = ecuId.ToString(),
                     direction,
-                    signals = Array.Empty<object>(),
+                    signals = signalsResult,
                 });
             }
             catch (Exception ex)
@@ -323,6 +329,79 @@ namespace MatchPdt.Helper.Services
                 return Convert.ToInt32(raw, 16);
             }
             return req.GetIntParam("can_id");
+        }
+
+        /// <summary>
+        /// Parse the v1 signals string ("name:startbit:sizebits,...") and create a
+        /// CanSignal per entry on the given message. Returns one summary dict per
+        /// signal so the caller can echo them in the v1-shaped response.
+        /// </summary>
+        private static List<object> AddSignals(RpcRequest req, Assembly canContracts, Assembly businessIfaces, Guid messageId)
+        {
+            var spec = req.GetStringParam("signals", "").Trim();
+            var result = new List<object>();
+            if (string.IsNullOrEmpty(spec)) return result;
+
+            var canSignalType = canContracts.GetType("Hydac.PDT.Can.Business.Contracts.Model.CanSignal", throwOnError: true)!;
+            var sigRepoType = canContracts.GetType("Hydac.PDT.Can.Business.Contracts.Repository.ICanSignalRepository", throwOnError: true)!;
+            var sigSvcType = canContracts.GetType("Hydac.PDT.Can.Business.Contracts.Signal.ISignalService", throwOnError: true)!;
+            var dataTypeLoaderType = businessIfaces.GetType("Hydac.PDT.Business.Datapool.DataTransfer.IDataTypeLoader", throwOnError: true)!;
+
+            var sigRepo = HostBootstrap.ResolveByReflection(sigRepoType)
+                ?? throw new InvalidOperationException("ICanSignalRepository not registered");
+            var sigSvc = HostBootstrap.ResolveByReflection(sigSvcType)
+                ?? throw new InvalidOperationException("ISignalService not registered");
+            var dtLoader = HostBootstrap.ResolveByReflection(dataTypeLoaderType)
+                ?? throw new InvalidOperationException("IDataTypeLoader not registered");
+
+            // Default datatype: TUINT8. For signals wider than 8 bits PDT auto-fits the
+            // size internally; ISignalService.SetSizeBits below sets the actual size.
+            var getByName = dataTypeLoaderType.GetMethod("GetByTypeName")!;
+            var defaultDataType = getByName.Invoke(dtLoader, new object[] { "TUINT8" })
+                ?? throw new InvalidOperationException("IDataTypeLoader.GetByTypeName('TUINT8') returned null");
+            var dataTypeId = (Guid)defaultDataType.GetType().GetProperty("GUID")!.GetValue(defaultDataType)!;
+
+            // CanSignal convenience ctor: (ownerId, startBit, name, dataTypeId, appDataTypeId).
+            var simpleSigCtor = canSignalType.GetConstructor(new[] { typeof(Guid), typeof(int), typeof(string), typeof(Guid), typeof(Guid) })!;
+            var addSig = sigRepoType.GetMethod("Add")!;
+            var setSize = sigSvcType.GetMethod("SetSizeBits")!;
+
+            foreach (var token in spec.Split(','))
+            {
+                var parts = token.Split(':');
+                if (parts.Length != 3)
+                    throw new ArgumentException($"signal entry must be 'name:startbit:sizebits' — got '{token}'");
+                var sigName = parts[0].Trim();
+                if (string.IsNullOrEmpty(sigName))
+                    throw new ArgumentException($"signal name required in '{token}'");
+                if (!int.TryParse(parts[1].Trim(), out var startBit))
+                    throw new ArgumentException($"startBit must be int in '{token}'");
+                if (!int.TryParse(parts[2].Trim(), out var sizeBits))
+                    throw new ArgumentException($"sizeBits must be int in '{token}'");
+
+                var signal = simpleSigCtor.Invoke(new object[] { messageId, startBit, sigName, dataTypeId, dataTypeId });
+                addSig.Invoke(sigRepo, new[] { signal });
+
+                if (sizeBits != 1)
+                {
+                    // SetSizeBits returns a new immutable CanSignal — repository.Update is
+                    // called inside the service.
+                    setSize.Invoke(sigSvc, new[] { signal, (object)sizeBits });
+                }
+
+                Program.WriteLog($"  signal: {sigName} startBit={startBit} sizeBits={sizeBits}");
+
+                var sigId = (Guid)canSignalType.GetProperty("Id")!.GetValue(signal)!;
+                result.Add(new
+                {
+                    name = sigName,
+                    start_bit = startBit,
+                    size_bits = sizeBits,
+                    id = sigId.ToString(),
+                });
+            }
+
+            return result;
         }
     }
 }

@@ -421,17 +421,29 @@ def add_db_variable(
     if type_upper not in VALID_VAR_TYPES:
         return f"Invalid type '{type}'. Must be one of: {', '.join(sorted(VALID_VAR_TYPES))}"
 
+    params = {
+        "database": database,
+        "name": name,
+        "type": type_upper,
+        "default": default,
+        "min": min,
+        "max": max,
+        "unit": unit,
+        "description": description,
+    }
     try:
-        result = _add_db_variable(database, name, type_upper, default, min, max, unit, description)
+        from helper_v2 import call as helper_v2_call
+        result = helper_v2_call("add_db_variable", params, timeout=60)
+        from parser import clear_cache as _clear
+        _clear()
     except Exception as e:
         return f"Error: {e}"
 
     if result.get("status") == "ok":
         return (
-            f"OK — Added variable '{result['name']}' to {result['database']}.\n"
-            f"  Type: {result['var_type']}  Default: {result['default_value']}\n"
-            f"  Range: [{result['min']} .. {result['max']}]  Unit: {result.get('unit', '[-]')}\n"
-            f"  CommID: {result['comm_id']}  Idx: {result['idx']}  GUID: {result['guid']}\n"
+            f"OK — Added variable '{result['name']}' to {result.get('list_id', database)}.\n"
+            f"  Type: {result['type']}  Default: {result.get('default','')}\n"
+            f"  GUID: {result['var_id']}\n"
             f"\nCache cleared. Use reload_hdb to verify."
         )
     return f"Unexpected result: {result}"
@@ -1196,16 +1208,20 @@ def add_can_message(
     signals: str = "",
     bus: int = 1,
 ) -> str:
-    """Add a new CAN message to the HDB project with all required XML structure.
+    """Add a new CAN message to the HDB project via PDT services (v2).
 
-    Creates entries in CanMessages.xml, CanMessageEcuLinks.xml, and CanSignals.xml.
-    All required sub-elements are included so PDT can load the project without errors.
-    Creates a .hdb.bak backup before the first modification.
+    Routes through dotnet-helper-v2 which uses PDT's ICanMessageRepository,
+    ICanSignalRepository, and ICanMessageEcuLinkService.SetNewUsage to create
+    the message + signals + ECU link + CSND/CRCV software block in one
+    transaction. The v1 caveat ("Usage set to None, must toggle in PDT
+    manually to generate the Message Block") is gone — SetNewUsage triggers
+    block creation the same way the GUI's Network tab Usage flip does.
 
     Args:
         name: Message name (e.g. 'VcuSendTestData').
         can_id: CAN ID as decimal (e.g. 419365500). Extended if > 0x7FF.
-        direction: 'SendCyclically', 'SendEventBased', or 'Receive'.
+        direction: 'SendCyclically', 'SendEventBased', 'SendCyclicallyAndEventBased',
+                   'SendMessageBuffer', or 'Receive'.
         dlc: Data Length Code, 0-8 (default 8).
         cycle_time: Cycle time in milliseconds (default 100).
         signals: Comma-separated signal definitions as 'name:startbit:sizebits'.
@@ -1214,105 +1230,35 @@ def add_can_message(
         bus: Bus number (1-indexed). Use list_can_buses to see available buses.
              Default 1 (first/only bus).
     """
-    valid_dirs = ("SendCyclically", "SendEventBased", "Receive")
+    valid_dirs = ("SendCyclically", "SendEventBased",
+                  "SendCyclicallyAndEventBased", "SendMessageBuffer", "Receive")
     if direction not in valid_dirs:
         return f"Invalid direction '{direction}'. Use: {', '.join(valid_dirs)}"
-
     if dlc < 0 or dlc > 8:
         return "DLC must be 0-8."
 
-    # Look up bus info
+    params = {
+        "name": name,
+        "can_id": can_id,
+        "direction": direction,
+        "dlc": dlc,
+        "cycle_time": cycle_time,
+        "signals": signals,
+        "bus": bus,
+    }
     try:
-        bus_info = _get_bus_info(bus)
-    except ValueError as e:
-        return str(e)
-
-    data = get_cache()
-    dt_id = data.get("data_type_id", "")
-    if not dt_id:
-        return "Cannot determine DataTypeId — no existing signals found in the project."
-    ecu_dt_id = data.get("ecu_data_type_id", dt_id)
-
-    # Parse signals
-    sig_defs = []
-    if signals.strip():
-        for part in signals.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            pieces = part.split(":")
-            if len(pieces) != 3:
-                return f"Invalid signal format '{part}'. Expected 'name:startbit:sizebits'."
-            try:
-                sig_defs.append((pieces[0], int(pieces[1]), int(pieces[2])))
-            except ValueError:
-                return f"Invalid signal numbers in '{part}'. startbit and sizebits must be integers."
-
-    msg_guid = str(uuid.uuid4())
-
-    # 1. Add message to CanMessages.xml
-    try:
-        msg_root = read_xml_from_hdb("CanMessages.xml")
-    except Exception as e:
-        return f"Error reading CanMessages.xml: {e}"
-
-    msg_el = _build_message_element(msg_guid, name, can_id, dlc, cycle_time, bus_info["bus_id"])
-    msg_root.append(msg_el)
-
-    try:
-        write_xml_to_hdb("CanMessages.xml", msg_root)
-    except Exception as e:
-        return f"Error writing CanMessages.xml: {e}"
-
-    # 2. Add ECU link to CanMessageEcuLinks.xml
-    try:
-        link_root = read_xml_from_hdb("CanMessageEcuLinks.xml")
-    except Exception as e:
-        return f"Error reading CanMessageEcuLinks.xml: {e}"
-
-    link_el = _build_ecu_link_element(
-        msg_guid, direction,
-        bus_info["ecu_id"], bus_info["send_buffer"], bus_info["recv_buffer"],
-    )
-    link_root.append(link_el)
-
-    try:
-        write_xml_to_hdb("CanMessageEcuLinks.xml", link_root)
-    except Exception as e:
-        return f"Error writing CanMessageEcuLinks.xml: {e}"
-
-    # 3. Add signals to CanSignals.xml
-    if sig_defs:
-        try:
-            sig_root = read_xml_from_hdb("CanSignals.xml")
-        except Exception as e:
-            return f"Error reading CanSignals.xml: {e}"
-
-        for sig_name, start_bit, size_bits in sig_defs:
-            sig_el = _build_signal_element(msg_guid, sig_name, start_bit, size_bits, dt_id, ecu_dt_id)
-            sig_root.append(sig_el)
-
-        try:
-            write_xml_to_hdb("CanSignals.xml", sig_root)
-        except Exception as e:
-            return f"Error writing CanSignals.xml: {e}"
-
-    # 4. Reload cache and return result
-    clear_cache()
-    try:
-        data = get_cache()
-    except Exception as e:
-        return f"Message added but reload failed: {e}"
-
-    dir_label = "TXC" if direction != "Receive" else "RXC"
-    note = (f"\n\n**Note:** Usage is set to '{direction}' in the XML, but the "
-            f"CSND/CRCV software block is NOT created by this tool. Open the "
-            f"message in PDT → Network tab and re-set Usage to {dir_label} "
-            f"(or toggle it) to make PDT generate the Message Block.")
-    msg_data = data["messages_by_name"].get(name.lower())
-    if msg_data:
-        return f"OK — Added message to HDB.\n\n{fmt_message(msg_data)}{note}"
-    return f"OK — Added '{name}' (CAN ID {can_id}) with {len(sig_defs)} signal(s).{note}"
+        from helper_v2 import call as helper_v2_call, HelperError
+        result = helper_v2_call("add_can_message", params, timeout=60)
+        clear_cache()
+        sig_count = len(result.get("signals", []))
+        msg = (f"OK — added '{result['name']}' (can_id={result['can_id']}, "
+               f"direction={result['direction']}, signals={sig_count}). "
+               f"msg_guid={result['msg_guid']}")
+        return msg
+    except Exception as v2_err:
+        import sys as _sys
+        print(f"[Match_PDT_MCP] v2 add_can_message failed ({v2_err})", file=_sys.stderr)
+        return f"Error: {v2_err}"
 
 
 # ---------------------------------------------------------------------------

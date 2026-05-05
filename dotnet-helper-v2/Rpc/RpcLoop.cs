@@ -70,6 +70,8 @@ namespace MatchPdt.Helper.Rpc
                     "delete_err_block" => Services.ErrorService.DeleteErrBlock(_host, req),
                     "add_can_message"  => Services.CanMessageService.AddCanMessage(_host, req),
                     "dump_can_messages"=> Services.CanMessageService.DumpCanMessages(_host, req),
+                    "add_db_variable"  => Services.DbVariableService.AddDbVariable(_host, req),
+                    "dump_db_variables"=> Services.DbVariableService.DumpDbVariables(_host, req),
                     "probe_type"       => ProbeType(req),
                     "dump_block_types" => RpcResponse.Ok(req.Id, Services.ErrorService.DumpStandardBlockTypes()),
 

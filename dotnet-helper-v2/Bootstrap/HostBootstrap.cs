@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -258,43 +259,105 @@ namespace MatchPdt.Helper.Bootstrap
                 throw tie.InnerException;
             }
 
-            // ProjectAgent.Save doesn't emit Errors.dat (no persistence adapter is wired
-            // for headless flows). Write it explicitly via ISaveErrorsToDataLayer, which
-            // serializes IErrorCollection → BinaryFormatter → Errors.dat in the saved
-            // .hdb. This must happen AFTER ProjectAgent.Save (which sets DataLayer
-            // .FileBackup to the saved .hdb path) and BEFORE the snapshot merge (so the
-            // merge sees Errors.dat as already-present and skips the stale carry-forward).
-            WriteErrorsDat();
+            // IProjectAgent.Save only writes project.dat + info.xml. The GUI's full save
+            // path (Hydac.PDT.ViewModel.SaveProjectAdapter.Save) follows up by iterating
+            // every IAdapterBase + ISaveAdapterBaseAsync registered in the project scope
+            // and invoking each one's Save / SaveAsync(). Those adapters write per-file
+            // payloads (CanMessages.xml, CanSignals.xml, CanMessageEcuLinks.xml,
+            // HymlEcuTemplates.xml, DatabaseLists.xml, etc.) from their respective caches.
+            //
+            // Headless v2 was missing this step → any data caches we mutated were silently
+            // dropped on save (Phase 3 smoke caught this: add_can_message wrote to the
+            // ICanMessageCache, but the saved .hdb only had the pristine CanMessages.xml).
+            // Now we replicate the GUI loop ourselves.
+            //
+            // SaveErrors (writes Errors.dat) is registered as ISaveAdapterBaseAsync, so the
+            // adapter loop covers it — Phase 2's standalone WriteErrorsDat helper is gone.
+            RunSaveAdapters();
 
             MergeMissingFilesFromSnapshot(HdbFile.FullName, PristineSnapshotPath);
             PatchInfoXmlVersion(HdbFile.FullName);
         }
 
-        private void WriteErrorsDat()
+        /// <summary>
+        /// Replicate Hydac.PDT.ViewModel.SaveProjectAdapter.SaveViaSaveAdapterAsync():
+        /// resolve every IAdapterBase + ISaveAdapterBaseAsync from the project scope and
+        /// invoke their save methods. Without this, per-file persistence adapters
+        /// (CanMessages.xml, HymlEcuTemplates.xml, DatabaseLists.xml, Errors.dat, ...)
+        /// never run and the headless save loses every cache mutation.
+        /// </summary>
+        private void RunSaveAdapters()
         {
             try
             {
-                var errorsContracts = Assembly.Load("Hydac.PDT.Errors.Business.Contracts");
-                var saveType = errorsContracts.GetType(
-                    "Hydac.PDT.Errors.Business.Contracts.Loader.ISaveErrorsToDataLayer",
-                    throwOnError: true)!;
-                var saver = ResolveByReflection(saveType)
-                    ?? throw new InvalidOperationException("ISaveErrorsToDataLayer not registered");
+                var businessIfaces = Assembly.Load("Hydac.PDT.Business.Interfaces");
+                var pdtFw = Assembly.Load("Hydac.PDT.PdtFramework");
 
-                var collectionType = errorsContracts.GetType(
-                    "Hydac.PDT.Errors.Business.Contracts.IErrorCollection", throwOnError: true)!;
-                var collection = ResolveByReflection(collectionType)
-                    ?? throw new InvalidOperationException("IErrorCollection not registered");
+                var projectServiceType = businessIfaces.GetType(
+                    "Hydac.PDT.Business.Contracts.Project.IProjectService", throwOnError: true)!;
+                var projectService = ResolveByReflection(projectServiceType)
+                    ?? throw new InvalidOperationException("IProjectService not registered");
 
-                var save = saveType.GetMethod("Save")!;
-                save.Invoke(saver, new[] { collection });
+                var resolveForProject = projectServiceType.GetMethod("ResolveForProject")!;
 
-                var count = ((System.Collections.IEnumerable)collection).Cast<object>().Count();
-                Program.WriteLog($"Wrote Errors.dat with {count} errors");
+                // Sync adapters first: IAdapterBase.Save()
+                var adapterBaseType = pdtFw.GetType("Hydac.PDT.PdtFramework.IAdapterBase", throwOnError: false);
+                if (adapterBaseType != null)
+                {
+                    var enumerableType = typeof(IEnumerable<>).MakeGenericType(adapterBaseType);
+                    var generic = resolveForProject.MakeGenericMethod(enumerableType);
+                    var adapters = (IEnumerable)generic.Invoke(projectService, null)!;
+                    int count = 0;
+                    foreach (var a in adapters)
+                    {
+                        try
+                        {
+                            adapterBaseType.GetMethod("Save")?.Invoke(a, null);
+                            count++;
+                        }
+                        catch (Exception ex)
+                        {
+                            Program.WriteLog($"sync save adapter {a.GetType().Name} failed: {ex.GetBaseException().Message}");
+                        }
+                    }
+                    Program.WriteLog($"Ran {count} sync save adapters (IAdapterBase)");
+                }
+
+                // Async adapters: ISaveAdapterBaseAsync.SaveAsync()
+                var saveAsyncType = pdtFw.GetType("Hydac.PDT.PdtFramework.ISaveAdapterBaseAsync", throwOnError: true)!;
+                var asyncEnumerableType = typeof(IEnumerable<>).MakeGenericType(saveAsyncType);
+                var asyncResolve = resolveForProject.MakeGenericMethod(asyncEnumerableType);
+                var asyncAdapters = (IEnumerable)asyncResolve.Invoke(projectService, null)!;
+                int asyncCount = 0;
+                foreach (var a in asyncAdapters)
+                {
+                    var adapterName = a.GetType().Name;
+                    try
+                    {
+                        // Sync-over-async on the dispatcher thread deadlocks: SaveAsync's
+                        // continuations capture the dispatcher's SynchronizationContext and
+                        // queue back to it, but we're blocking the dispatcher with
+                        // GetResult(). Run via Task.Run so the awaited operation runs on the
+                        // threadpool (no SyncContext → continuations resume on threadpool)
+                        // and we don't starve the dispatcher.
+                        var saveAsyncMethod = saveAsyncType.GetMethod("SaveAsync")!;
+                        Task.Run(async () =>
+                        {
+                            var t = (Task)saveAsyncMethod.Invoke(a, null)!;
+                            await t.ConfigureAwait(false);
+                        }).GetAwaiter().GetResult();
+                        asyncCount++;
+                    }
+                    catch (Exception ex)
+                    {
+                        Program.WriteLog($"async save adapter {adapterName} failed: {ex.GetBaseException().Message}");
+                    }
+                }
+                Program.WriteLog($"Ran {asyncCount} async save adapters (ISaveAdapterBaseAsync)");
             }
             catch (Exception ex)
             {
-                Program.WriteLog($"WriteErrorsDat warning (non-fatal): {ex.Message}");
+                Program.WriteLog($"RunSaveAdapters failed (non-fatal): {ex.Message}");
             }
         }
 

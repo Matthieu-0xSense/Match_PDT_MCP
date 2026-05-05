@@ -170,27 +170,159 @@ namespace MatchPdt.Helper.Services
 
         public static RpcResponse AddCanMessage(HostBootstrap host, RpcRequest req)
         {
-            // TODO Phase 3 implementation.
-            // Wire the JSON contract → service calls:
-            //   1. Resolve ICanMessageRepository, ICanMessageEcuLinkRepository,
-            //      ICanMessageEcuLinkService, ICanSignalRepository (or equivalent).
-            //   2. Find bus by 1-indexed input.bus → busId, find associated send/recv
-            //      buffer blocks and CAN block (mirror _get_bus_info in server.py).
-            //   3. Construct CanMessage with the 16-arg ctor, validate uniqueness.
-            //   4. ICanMessageRepository.Add(canMessage).
-            //   5. Construct CanMessageEcuLink with messageId, ecuId, Usage.None,
-            //      buffer/canBlock GUIDs.
-            //   6. ICanMessageEcuLinkRepository.Add(ecuLink).
-            //   7. For each signal definition, construct CanSignal via
-            //      ICanSignalRepository.Add (or via ITRepository.NewCanSignal if it exists).
-            //   8. ICanMessageEcuLinkService.SetNewUsage(messageId, ecuLinkId, mapped Usage)
-            //      to trigger CSND/CRCV block creation — this is the killer feature
-            //      that kills v1's "set Usage in PDT manually" caveat.
-            //   9. host.SaveProject() — extend HostBootstrap.WriteErrorsDat-style
-            //      pattern with WriteCanMessagesDat covering the CAN-side persistence types.
-            //  10. Return v1-shaped result: { status, message, name, can_id, msg_guid, signals }.
-            return RpcResponse.Fail(req.Id, RpcErrorCodes.MethodNotFound,
-                "add_can_message v2 not yet implemented; server.py keeps using v1");
+            try
+            {
+                var name = req.GetStringParam("name");
+                var direction = req.GetStringParam("direction", "Receive");
+                var dlc = req.GetIntParam("dlc", 8);
+                var cycleTime = req.GetIntParam("cycle_time", 50);
+                var busOneIndexed = req.GetIntParam("bus", 1);
+                var description = req.GetStringParam("description");
+                if (string.IsNullOrEmpty(name))
+                    throw new ArgumentException("'name' is required");
+
+                int canId = ParseCanId(req);
+
+                var canContracts = Assembly.Load("Hydac.PDT.Can.Business.Contracts");
+                var businessIfaces = Assembly.Load("Hydac.PDT.Business.Interfaces");
+
+                var canMessageType = canContracts.GetType("Hydac.PDT.Can.Business.Contracts.Model.CanMessage", throwOnError: true)!;
+                var msgRepoType = canContracts.GetType("Hydac.PDT.Can.Business.Contracts.Repository.ICanMessageRepository", throwOnError: true)!;
+                var linkSvcType = canContracts.GetType("Hydac.PDT.Can.Business.Contracts.Message.ICanMessageEcuLinkService", throwOnError: true)!;
+                var msgSvcType = canContracts.GetType("Hydac.PDT.Can.Business.Contracts.Message.IMessageService", throwOnError: true)!;
+                var usageEnum = canContracts.GetType("Hydac.PDT.Can.Business.Contracts.Model.CanMessageEcuLinkUsage", throwOnError: true)!;
+                // CanMessageType + CanMessageByteOrder live in Business.Interfaces (Hydac.PDT.Business.Can namespace)
+                var msgTypeEnum = businessIfaces.GetType("Hydac.PDT.Business.Can.CanMessageType", throwOnError: true)!;
+
+                var msgRepo = HostBootstrap.ResolveByReflection(msgRepoType)
+                    ?? throw new InvalidOperationException("ICanMessageRepository not registered");
+                var linkSvc = HostBootstrap.ResolveByReflection(linkSvcType)
+                    ?? throw new InvalidOperationException("ICanMessageEcuLinkService not registered");
+                var msgSvc = HostBootstrap.ResolveByReflection(msgSvcType)
+                    ?? throw new InvalidOperationException("IMessageService not registered");
+
+                // Get IProjectAgent → CanBusses (note: spelled with double-s in PDT API)
+                var projectServiceType = businessIfaces.GetType("Hydac.PDT.Business.Contracts.Project.IProjectService", throwOnError: true)!;
+                var projectService = HostBootstrap.ResolveByReflection(projectServiceType)
+                    ?? throw new InvalidOperationException("IProjectService not registered");
+                var actualAgent = projectServiceType.GetProperty("ActualProjectAgent")!.GetValue(projectService)
+                    ?? throw new InvalidOperationException("No project loaded");
+
+                var canBusses = (IEnumerable)actualAgent.GetType().GetProperty("CanBusses")!.GetValue(actualAgent)!;
+                var busList = canBusses.Cast<object>().ToList();
+                if (busOneIndexed < 1 || busOneIndexed > busList.Count)
+                    throw new ArgumentException($"'bus' must be 1..{busList.Count}, got {busOneIndexed}");
+                var bus = busList[busOneIndexed - 1];
+                var busId = (Guid)bus.GetType().GetProperty("ObjectId")!.GetValue(bus)!;
+
+                // First VirtualEcu (matches v1 single-ECU assumption — Phase 3 step 3 minimal scope)
+                var virtualEcus = (IEnumerable)actualAgent.GetType().GetProperty("VirtualEcus")!.GetValue(actualAgent)!;
+                var firstEcu = virtualEcus.Cast<object>().FirstOrDefault()
+                    ?? throw new InvalidOperationException("Project has no VirtualEcus");
+                var ecuId = (Guid)firstEcu.GetType().GetProperty("ObjectId")!.GetValue(firstEcu)!;
+
+                // Uniqueness checks against ICanMessageRepository.GetAll()
+                var allMessages = ((IEnumerable)msgRepoType.GetMethod("GetAll")!.Invoke(msgRepo, null)!).Cast<object>().ToList();
+                foreach (var existing in allMessages)
+                {
+                    var existingName = (string)existing.GetType().GetProperty("Name")!.GetValue(existing)!;
+                    var existingCanId = (int)existing.GetType().GetProperty("CanId")!.GetValue(existing)!;
+                    if (string.Equals(existingName, name, StringComparison.OrdinalIgnoreCase))
+                        throw new ArgumentException($"CAN message name '{name}' already exists.");
+                    if (existingCanId == canId)
+                        throw new ArgumentException($"CAN ID 0x{canId:X} already used by message '{existingName}'.");
+                }
+
+                // Build CanMessage with the convenience ctor (busId, name, canId, isMuxed=false),
+                // then chain With() to override Dlc + CycleTime + MessageType + Description.
+                var simpleCtor = canMessageType.GetConstructor(new[] { typeof(Guid), typeof(string), typeof(int), typeof(bool) })!;
+                var message = simpleCtor.Invoke(new object[] { busId, name, canId, false });
+
+                // Pick CanMessageType: Standard if 11-bit, Extended otherwise.
+                var msgType = (canId < 2048) ? Enum.Parse(msgTypeEnum, "Standard") : Enum.Parse(msgTypeEnum, "Extended");
+
+                // .With(... null params for fields we don't change ...) — call With via reflection.
+                // Signature: With(Guid id=default, Guid busId=default, string name=null, int? canId=null,
+                //                 CanMessageByteOrder? byteOrder=null, CanMessageType? messageType=null,
+                //                 int? dlc=null, byte? defaultByte=null, string description=null,
+                //                 int? cycleTime=null, int? startOffsetTime=null, int? minimumCycleTime=null,
+                //                 int? timeOut=null, CanMessageSafety safety=null,
+                //                 IEnumerable<Guid> consumerApplications=null, bool? isMuxed=null)
+                // Build args[16] respecting nullable types.
+                var withMethod = canMessageType.GetMethod("With")!;
+                var withParams = withMethod.GetParameters();
+                var withArgs = new object?[withParams.Length];
+                for (int i = 0; i < withParams.Length; i++) withArgs[i] = null;
+                // index map per signature above:
+                withArgs[5] = msgType;        // messageType
+                withArgs[6] = (int?)dlc;      // dlc
+                withArgs[8] = description;    // description
+                withArgs[9] = (int?)cycleTime;// cycleTime
+                message = withMethod.Invoke(message, withArgs)
+                    ?? throw new InvalidOperationException("CanMessage.With() returned null");
+
+                var messageId = (Guid)canMessageType.GetProperty("Id")!.GetValue(message)!;
+
+                // Add to repository (writes to ICanMessageCache.CanMessages source-cache).
+                msgRepoType.GetMethod("Add")!.Invoke(msgRepo, new[] { message });
+
+                // Map direction string → CanMessageEcuLinkUsage enum value.
+                object usageValue;
+                try { usageValue = Enum.Parse(usageEnum, direction, ignoreCase: true); }
+                catch (ArgumentException)
+                {
+                    throw new ArgumentException(
+                        $"'direction' must be one of: SendCyclically, SendEventBased, " +
+                        $"SendCyclicallyAndEventBased, SendMessageBuffer, Receive. Got '{direction}'.");
+                }
+
+                // Wrap as Nullable<CanMessageEcuLinkUsage> for the SetNewUsage signature.
+                var nullableUsageType = typeof(Nullable<>).MakeGenericType(usageEnum);
+                var nullableUsage = Activator.CreateInstance(nullableUsageType, usageValue);
+
+                // SetNewUsage(messageId, ecuId, usage?) — creates the ECU link AND the
+                // CSND/CRCV block via TRepository.Block, exactly like the GUI's Usage flip.
+                var setNewUsage = linkSvcType.GetMethod("SetNewUsage")!;
+                setNewUsage.Invoke(linkSvc, new object?[] { messageId, ecuId, nullableUsage });
+
+                Program.WriteLog($"add_can_message: created '{name}' (id={messageId}) on bus {busOneIndexed} ({busId}) with usage={direction}");
+
+                host.SaveProject();
+
+                return RpcResponse.Ok(req.Id, new
+                {
+                    status = "ok",
+                    message = $"Created CAN message '{name}' on bus {busOneIndexed} with usage {direction}",
+                    name,
+                    can_id = canId,
+                    msg_guid = messageId.ToString(),
+                    bus_id = busId.ToString(),
+                    ecu_id = ecuId.ToString(),
+                    direction,
+                    signals = Array.Empty<object>(),
+                });
+            }
+            catch (Exception ex)
+            {
+                Program.WriteLog($"add_can_message failed: {ex}");
+                return RpcResponse.Fail(req.Id, RpcErrorCodes.InternalError,
+                    $"{ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        // v1 accepts can_id as int or hex string ("0x18FF..."). Support both.
+        private static int ParseCanId(RpcRequest req)
+        {
+            var raw = req.GetStringParam("can_id");
+            if (!string.IsNullOrEmpty(raw))
+            {
+                raw = raw.Trim();
+                if (raw.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                    return Convert.ToInt32(raw.Substring(2), 16);
+                if (int.TryParse(raw, out var asDec)) return asDec;
+                return Convert.ToInt32(raw, 16);
+            }
+            return req.GetIntParam("can_id");
         }
     }
 }

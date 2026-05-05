@@ -69,6 +69,7 @@ namespace MatchPdt.Helper.Rpc
                     "add_custom_error" => Services.ErrorService.AddCustomError(_host, req),
                     "delete_err_block" => Services.ErrorService.DeleteErrBlock(_host, req),
                     "add_can_message"  => Services.CanMessageService.AddCanMessage(_host, req),
+                    "dump_can_messages"=> Services.CanMessageService.DumpCanMessages(_host, req),
                     "probe_type"       => ProbeType(req),
                     "dump_block_types" => RpcResponse.Ok(req.Id, Services.ErrorService.DumpStandardBlockTypes()),
 

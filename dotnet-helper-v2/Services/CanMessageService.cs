@@ -67,6 +67,107 @@ namespace MatchPdt.Helper.Services
     /// </summary>
     internal static class CanMessageService
     {
+        /// <summary>
+        /// Phase 3 probe: enumerate ICanMessageRepository.GetAll() and report counts +
+        /// each message's identity. Used to verify whether ICanMessageCache populates
+        /// at bootstrap (it must — otherwise add_can_message + save would silently
+        /// drop pre-existing messages because CanMessagePersistenceAdapter writes
+        /// CanMessages.xml from the cache, and snapshot-merge skips files already
+        /// present in the saved zip).
+        ///
+        /// Also dumps ICanMessageEcuLinkRepository.GetAll() + ICanSignalRepository.GetAll()
+        /// counts so we know all three caches are warm before any Add.
+        /// </summary>
+        public static RpcResponse DumpCanMessages(HostBootstrap host, RpcRequest req)
+        {
+            try
+            {
+                var canContracts = Assembly.Load("Hydac.PDT.Can.Business.Contracts");
+                var msgRepoType = canContracts.GetType(
+                    "Hydac.PDT.Can.Business.Contracts.Repository.ICanMessageRepository", throwOnError: true)!;
+                var linkRepoType = canContracts.GetType(
+                    "Hydac.PDT.Can.Business.Contracts.Repository.ICanMessageEcuLinkRepository", throwOnError: true)!;
+                var sigRepoType = canContracts.GetType(
+                    "Hydac.PDT.Can.Business.Contracts.Repository.ICanSignalRepository", throwOnError: true)!;
+                var linkSvcType = canContracts.GetType(
+                    "Hydac.PDT.Can.Business.Contracts.Message.ICanMessageEcuLinkService", throwOnError: true)!;
+                var msgSvcType = canContracts.GetType(
+                    "Hydac.PDT.Can.Business.Contracts.Message.IMessageService", throwOnError: true)!;
+                var sigSvcType = canContracts.GetType(
+                    "Hydac.PDT.Can.Business.Contracts.Signal.ISignalService", throwOnError: true)!;
+
+                var msgRepo = HostBootstrap.ResolveByReflection(msgRepoType);
+                var linkRepo = HostBootstrap.ResolveByReflection(linkRepoType);
+                var sigRepo = HostBootstrap.ResolveByReflection(sigRepoType);
+                var linkSvc = HostBootstrap.ResolveByReflection(linkSvcType);
+                var msgSvc = HostBootstrap.ResolveByReflection(msgSvcType);
+                var sigSvc = HostBootstrap.ResolveByReflection(sigSvcType);
+
+                var messages = (msgRepo == null) ? null : ((IEnumerable)msgRepoType.GetMethod("GetAll")!.Invoke(msgRepo, null)!).Cast<object>().ToList();
+                var links = (linkRepo == null) ? null : ((IEnumerable)linkRepoType.GetMethod("GetAll")!.Invoke(linkRepo, null)!).Cast<object>().ToList();
+                var signals = (sigRepo == null) ? null : ((IEnumerable)sigRepoType.GetMethod("GetAll")!.Invoke(sigRepo, null)!).Cast<object>().ToList();
+
+                static object Summarize(object? m)
+                {
+                    if (m == null) return new { _null = true };
+                    var t = m.GetType();
+                    string? str(string p) => t.GetProperty(p)?.GetValue(m)?.ToString();
+                    return new
+                    {
+                        id = str("Id"),
+                        bus_id = str("BusId"),
+                        name = str("Name"),
+                        can_id = str("CanId"),
+                        message_type = str("MessageType"),
+                        dlc = str("Dlc"),
+                        cycle_time = str("CycleTime"),
+                        is_muxed = str("IsMuxed"),
+                    };
+                }
+
+                static object SummarizeLink(object? l)
+                {
+                    if (l == null) return new { _null = true };
+                    var t = l.GetType();
+                    string? str(string p) => t.GetProperty(p)?.GetValue(l)?.ToString();
+                    return new
+                    {
+                        message_id = str("CanMessageId"),
+                        ecu_id = str("VirtualEcuId"),
+                        usage = str("Usage"),
+                        buffer_block = str("BufferBlockObjectId"),
+                        can_block = str("CanBlockObjectId"),
+                    };
+                }
+
+                return RpcResponse.Ok(req.Id, new
+                {
+                    services_resolved = new
+                    {
+                        ICanMessageRepository = msgRepo?.GetType().FullName,
+                        ICanMessageEcuLinkRepository = linkRepo?.GetType().FullName,
+                        ICanSignalRepository = sigRepo?.GetType().FullName,
+                        ICanMessageEcuLinkService = linkSvc?.GetType().FullName,
+                        IMessageService = msgSvc?.GetType().FullName,
+                        ISignalService = sigSvc?.GetType().FullName,
+                    },
+                    counts = new
+                    {
+                        messages = messages?.Count ?? -1,
+                        ecu_links = links?.Count ?? -1,
+                        signals = signals?.Count ?? -1,
+                    },
+                    sample_messages = messages?.Take(5).Select(Summarize).ToList(),
+                    sample_links = links?.Take(5).Select(SummarizeLink).ToList(),
+                });
+            }
+            catch (Exception ex)
+            {
+                return RpcResponse.Fail(req.Id, RpcErrorCodes.InternalError,
+                    $"{ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
         public static RpcResponse AddCanMessage(HostBootstrap host, RpcRequest req)
         {
             // TODO Phase 3 implementation.

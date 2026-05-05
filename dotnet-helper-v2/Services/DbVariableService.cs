@@ -280,6 +280,181 @@ namespace MatchPdt.Helper.Services
             }
         }
 
+        public static RpcResponse UpdateDbVariable(HostBootstrap host, RpcRequest req)
+        {
+            try
+            {
+                var listName = req.GetStringParam("database");
+                var varName = req.GetStringParam("variable");
+                if (string.IsNullOrEmpty(listName)) throw new ArgumentException("'database' is required");
+                if (string.IsNullOrEmpty(varName)) throw new ArgumentException("'variable' is required");
+
+                var (itVar, _, _) = ResolveVariable(listName, varName);
+                var varT = itVar.GetType();
+
+                bool changed = false;
+                if (TryParam(req, "default", out var defaultVal))
+                {
+                    var values = (IEnumerable)varT.GetProperty("Values")!.GetValue(itVar)!;
+                    foreach (var v in values) SetDefaultOnTValue(v, defaultVal);
+                    changed = true;
+                }
+                if (TryParam(req, "min", out var min))
+                {
+                    varT.GetProperty("Min")?.SetValue(itVar, min);
+                    changed = true;
+                }
+                if (TryParam(req, "max", out var max))
+                {
+                    varT.GetProperty("Max")?.SetValue(itVar, max);
+                    changed = true;
+                }
+                if (TryParam(req, "unit", out var unit))
+                {
+                    varT.GetProperty("UnitEcu")?.SetValue(itVar, unit);
+                    changed = true;
+                }
+                if (TryParam(req, "description", out var description))
+                {
+                    varT.GetProperty("Description")?.SetValue(itVar, description);
+                    changed = true;
+                }
+
+                if (!changed)
+                    throw new ArgumentException("No changes specified. Provide at least one of: default, min, max, unit, description.");
+
+                var varId = (Guid)varT.GetProperty("GUID")!.GetValue(itVar)!;
+                Program.WriteLog($"update_db_variable: '{varName}' (id={varId}) updated");
+
+                host.SaveProject();
+
+                return RpcResponse.Ok(req.Id, new
+                {
+                    status = "ok",
+                    message = $"Updated variable '{varName}' in '{listName}'",
+                    name = varName,
+                    var_id = varId.ToString(),
+                });
+            }
+            catch (Exception ex)
+            {
+                Program.WriteLog($"update_db_variable failed: {ex}");
+                return RpcResponse.Fail(req.Id, RpcErrorCodes.InternalError,
+                    $"{ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        public static RpcResponse DeleteDbVariable(HostBootstrap host, RpcRequest req)
+        {
+            try
+            {
+                var listName = req.GetStringParam("database");
+                var varName = req.GetStringParam("variable");
+                if (string.IsNullOrEmpty(listName)) throw new ArgumentException("'database' is required");
+                if (string.IsNullOrEmpty(varName)) throw new ArgumentException("'variable' is required");
+
+                var (itVar, _, oldFactoryType) = ResolveVariable(listName, varName);
+                var oldFactory = HostBootstrap.ResolveByReflection(oldFactoryType)
+                    ?? throw new InvalidOperationException("IOldDatabaseVariableFactory not registered");
+
+                var varId = (Guid)itVar.GetType().GetProperty("GUID")!.GetValue(itVar)!;
+
+                // Release(ITVar) handles cascade: HstGroups, BlockParameter links, Values,
+                // repository delete. The contract surface for delete that we can rely on.
+                var release = oldFactoryType.GetMethod("Release")!;
+                try { release.Invoke(oldFactory, new[] { itVar }); }
+                catch (TargetInvocationException tie) when (tie.InnerException is not null) { throw tie.InnerException; }
+
+                Program.WriteLog($"delete_db_variable: '{varName}' (id={varId}) released");
+
+                host.SaveProject();
+
+                return RpcResponse.Ok(req.Id, new
+                {
+                    status = "ok",
+                    message = $"Deleted variable '{varName}' from '{listName}'",
+                    name = varName,
+                    var_id = varId.ToString(),
+                });
+            }
+            catch (Exception ex)
+            {
+                Program.WriteLog($"delete_db_variable failed: {ex}");
+                return RpcResponse.Fail(req.Id, RpcErrorCodes.InternalError,
+                    $"{ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Resolve an ITVar by (listName, varName) on the first VirtualEcu. Returns the
+        /// ITVar plus the IOldDatabaseVariableFactory type for callers that need it
+        /// (delete) so we don't duplicate the assembly+type lookups.
+        /// </summary>
+        private static (object itVar, object varRepo, Type oldFactoryType) ResolveVariable(string listName, string varName)
+        {
+            var dbContracts = Assembly.Load("Hydac.PDT.Database.Business.Contracts");
+            var businessIfaces = Assembly.Load("Hydac.PDT.Business.Interfaces");
+            var dbObjects = Assembly.Load("DatabaseObjects");
+
+            var listRepoType = dbContracts.GetType(
+                "Hydac.PDT.Database.Business.Contracts.IDatabaseListRepository", throwOnError: true)!;
+            var varRepoType = dbContracts.GetType(
+                "Hydac.PDT.Database.Business.Contracts.Variables.IDatabaseVariableRepository", throwOnError: true)!;
+            var oldFactoryType = dbObjects.GetType("Hydac.PDT.ViewModel.IOldDatabaseVariableFactory", throwOnError: false)
+                ?? FindTypeBySimpleName("IOldDatabaseVariableFactory")
+                ?? throw new InvalidOperationException("IOldDatabaseVariableFactory type not found");
+
+            var listRepo = HostBootstrap.ResolveByReflection(listRepoType)
+                ?? throw new InvalidOperationException("IDatabaseListRepository not registered");
+            var varRepo = HostBootstrap.ResolveByReflection(varRepoType)
+                ?? throw new InvalidOperationException("IDatabaseVariableRepository not registered");
+
+            var projectServiceType = businessIfaces.GetType(
+                "Hydac.PDT.Business.Contracts.Project.IProjectService", throwOnError: true)!;
+            var projectService = HostBootstrap.ResolveByReflection(projectServiceType)
+                ?? throw new InvalidOperationException("IProjectService not registered");
+            var actualAgent = projectServiceType.GetProperty("ActualProjectAgent")!.GetValue(projectService)
+                ?? throw new InvalidOperationException("No project loaded");
+            var virtualEcus = (IEnumerable)actualAgent.GetType().GetProperty("VirtualEcus")!.GetValue(actualAgent)!;
+            var firstEcu = virtualEcus.Cast<object>().FirstOrDefault()
+                ?? throw new InvalidOperationException("Project has no VirtualEcus");
+            var ecuId = (Guid)firstEcu.GetType().GetProperty("ObjectId")!.GetValue(firstEcu)!;
+
+            var dbList = listRepoType.GetMethod("GetByEcuIdAndName")!.Invoke(listRepo, new object[] { ecuId, listName })
+                ?? throw new ArgumentException($"Database list '{listName}' not found.");
+            var listId = (Guid)dbList.GetType().GetProperty("Id")!.GetValue(dbList)!;
+
+            // ITVar lives in TRepository.Variables, but we need an interface-typed handle
+            // to call Release(ITVar). The repository contract returns DatabaseVariable
+            // (model), not ITVar — so we walk projectAgent.Repository.Variables directly.
+            var repository = actualAgent.GetType().GetProperty("Repository")!.GetValue(actualAgent)!;
+            var allVars = (IEnumerable)repository.GetType().GetProperty("Variables")!.GetValue(repository)!;
+            object? itVar = null;
+            foreach (var v in allVars)
+            {
+                var vType = v.GetType();
+                var vListId = (Guid)vType.GetProperty("DatabaseListId")!.GetValue(v)!;
+                var vName = (string?)vType.GetProperty("Name")?.GetValue(v);
+                if (vListId == listId && string.Equals(vName, varName, StringComparison.OrdinalIgnoreCase))
+                {
+                    itVar = v;
+                    break;
+                }
+            }
+            if (itVar == null)
+                throw new ArgumentException($"Variable '{varName}' not found in '{listName}'.");
+
+            return (itVar, varRepo, oldFactoryType);
+        }
+
+        private static bool TryParam(RpcRequest req, string name, out string value)
+        {
+            value = req.GetStringParam(name, "");
+            // Treat empty string as "not provided" — matches v1 contract where empty
+            // strings mean "keep current".
+            return !string.IsNullOrEmpty(value);
+        }
+
         private static Type? FindTypeBySimpleName(string name)
         {
             return AppDomain.CurrentDomain.GetAssemblies()

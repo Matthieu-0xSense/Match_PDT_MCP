@@ -71,6 +71,8 @@ namespace MatchPdt.Helper.Rpc
                     "add_can_message"  => Services.CanMessageService.AddCanMessage(_host, req),
                     "dump_can_messages"=> Services.CanMessageService.DumpCanMessages(_host, req),
                     "add_db_variable"  => Services.DbVariableService.AddDbVariable(_host, req),
+                    "update_db_variable"=> Services.DbVariableService.UpdateDbVariable(_host, req),
+                    "delete_db_variable"=> Services.DbVariableService.DeleteDbVariable(_host, req),
                     "dump_db_variables"=> Services.DbVariableService.DumpDbVariables(_host, req),
                     "probe_type"       => ProbeType(req),
                     "dump_block_types" => RpcResponse.Ok(req.Id, Services.ErrorService.DumpStandardBlockTypes()),

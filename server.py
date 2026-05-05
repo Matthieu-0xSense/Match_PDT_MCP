@@ -474,29 +474,27 @@ def update_db_variable(
         unit: New unit string. Empty to keep current.
         description: New description. Empty to keep current.
     """
-    kwargs = {}
-    if default:
-        kwargs["default"] = default
-    if min:
-        kwargs["min"] = min
-    if max:
-        kwargs["max"] = max
-    if unit:
-        kwargs["unit"] = unit
-    if description:
-        kwargs["description"] = description
+    params = {"database": database, "variable": variable}
+    if default: params["default"] = default
+    if min: params["min"] = min
+    if max: params["max"] = max
+    if unit: params["unit"] = unit
+    if description: params["description"] = description
 
-    if not kwargs:
+    if len(params) == 2:
         return "No changes specified. Provide at least one of: default, min, max, unit, description."
 
     try:
-        result = _update_db_variable(database, variable, **kwargs)
+        from helper_v2 import call as helper_v2_call
+        result = helper_v2_call("update_db_variable", params, timeout=60)
+        from parser import clear_cache as _clear
+        _clear()
     except Exception as e:
         return f"Error: {e}"
 
     if result.get("status") == "ok":
-        changes = ", ".join(f"{k}={v}" for k, v in kwargs.items())
-        return f"OK — Updated '{result['name']}' in {result['database']}: {changes}\nCache cleared."
+        changes = ", ".join(f"{k}={v}" for k, v in params.items() if k not in ("database", "variable"))
+        return f"OK — Updated '{result['name']}' in {database}: {changes}\nCache cleared."
     return f"Unexpected result: {result}"
 
 
@@ -512,12 +510,17 @@ def delete_db_variable(database: str, variable: str) -> str:
         variable: Variable name to delete (case-insensitive).
     """
     try:
-        result = _delete_db_variable(database, variable)
+        from helper_v2 import call as helper_v2_call
+        result = helper_v2_call("delete_db_variable",
+                                {"database": database, "variable": variable},
+                                timeout=60)
+        from parser import clear_cache as _clear
+        _clear()
     except Exception as e:
         return f"Error: {e}"
 
     if result.get("status") == "ok":
-        return f"OK — Deleted '{result['name']}' from {result['database']}.\nCache cleared."
+        return f"OK — Deleted '{result['name']}' from {database}.\nCache cleared."
     return f"Unexpected result: {result}"
 
 

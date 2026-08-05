@@ -74,6 +74,9 @@ namespace MatchPdt.Helper.Rpc
                     "update_db_variable"=> Services.DbVariableService.UpdateDbVariable(_host, req),
                     "delete_db_variable"=> Services.DbVariableService.DeleteDbVariable(_host, req),
                     "dump_db_variables"=> Services.DbVariableService.DumpDbVariables(_host, req),
+                    "renumber_comm_ids"=> Services.DbVariableService.RenumberCommIds(_host, req),
+                    "probe_var_members"=> Services.DbVariableService.ProbeVarMembers(_host, req),
+                    "renumber_idx"     => Services.DbVariableService.RenumberIdx(_host, req),
                     "probe_type"       => ProbeType(req),
                     "dump_block_types" => RpcResponse.Ok(req.Id, Services.ErrorService.DumpStandardBlockTypes()),
 

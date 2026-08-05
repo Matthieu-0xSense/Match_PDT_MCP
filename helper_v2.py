@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import atexit
+import collections
 import json
 import os
 import subprocess
@@ -29,6 +30,12 @@ from typing import Any
 _PROC: subprocess.Popen | None = None
 _LOCK = threading.Lock()
 _NEXT_ID = 1
+# Ring buffer of the helper's stderr, filled by a drain thread. The helper logs
+# every operation to stderr; with stderr=PIPE and nobody reading, the OS pipe
+# buffer fills and the helper blocks forever on its own WriteLog. That looks
+# exactly like a hung RPC call. Keep the pipe drained and the tail available
+# for error messages.
+_STDERR_TAIL: collections.deque = collections.deque(maxlen=400)
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 _HELPER_EXE = os.path.join(
     _REPO_ROOT, "dotnet-helper-v2", "bin", "Debug", "net48",
@@ -62,19 +69,42 @@ def _start(hdb_path: str, pdt_dir: str) -> subprocess.Popen:
         bufsize=1,  # line-buffered
     )
 
+    _STDERR_TAIL.clear()
+    _start_stderr_drain(proc)
+
     # Drain stdout until "Ready." — anything before is PDT's dialog noise.
     while True:
         line = proc.stdout.readline() if proc.stdout else ""
         if not line:
-            stderr = proc.stderr.read() if proc.stderr else ""
             raise HelperError(
                 f"dotnet-helper-v2 exited before Ready (rc={proc.returncode}). "
-                f"stderr tail:\n{stderr[-2000:]}"
+                f"stderr tail:\n{stderr_tail()}"
             )
         if line.strip() == "Ready.":
             break
 
     return proc
+
+
+def _start_stderr_drain(proc: subprocess.Popen) -> None:
+    """Keep the helper's stderr pipe empty so it can never block writing to it."""
+    def drain() -> None:
+        stream = proc.stderr
+        if stream is None:
+            return
+        for line in iter(stream.readline, ""):
+            _STDERR_TAIL.append(line.rstrip("\n"))
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+    threading.Thread(target=drain, daemon=True, name="helper_v2-stderr").start()
+
+
+def stderr_tail(n: int = 40) -> str:
+    """Last n lines the helper logged — useful when a call fails."""
+    return "\n".join(list(_STDERR_TAIL)[-n:])
 
 
 def _ensure(hdb_path: str, pdt_dir: str) -> subprocess.Popen:
@@ -104,7 +134,7 @@ def call(method: str, params: dict[str, Any] | None = None,
         raise HelperError("HDB_PATH not set; cannot start dotnet-helper-v2")
 
     proc = _ensure(hdb_path, pdt_dir)
-    global _NEXT_ID
+    global _NEXT_ID, _PROC
     with _LOCK:
         req_id = _NEXT_ID
         _NEXT_ID += 1
@@ -117,13 +147,48 @@ def call(method: str, params: dict[str, Any] | None = None,
         proc.stdin.flush()
         # PDT's dialog adapter occasionally writes blank/non-JSON lines to stdout
         # mid-session. Skip anything that doesn't start with '{'.
-        while True:
-            line = proc.stdout.readline()
-            if not line:
-                raise HelperError("helper closed stdout unexpectedly")
-            if line.lstrip().startswith("{"):
-                break
-            print(f"[helper_v2 skip] {line!r}", file=sys.stderr)
+        #
+        # readline() blocks forever, so `timeout` was previously decorative: a
+        # wedged helper hung the caller indefinitely. Read on a worker thread and
+        # enforce the deadline. On expiry the helper is killed so the next call
+        # respawns a clean one.
+        box: dict[str, Any] = {}
+
+        def _read() -> None:
+            try:
+                while True:
+                    raw = proc.stdout.readline()
+                    if not raw:
+                        box["err"] = HelperError("helper closed stdout unexpectedly")
+                        return
+                    if raw.lstrip().startswith("{"):
+                        box["line"] = raw
+                        return
+                    print(f"[helper_v2 skip] {raw!r}", file=sys.stderr)
+            except Exception as exc:  # noqa: BLE001 - surfaced to the caller
+                box["err"] = exc
+
+        # NOTE: killing mid-save is not free. HostBootstrap.SaveProject writes the
+        # project and only afterwards patches info.xml's PdtVersionString back from
+        # PDT's own stamp (1.0.0.0, our assembly version). A kill landing between
+        # those two steps leaves the .hdb unloadable by PDT and by the next helper
+        # launch. Repair by rewriting info.xml, or make the save atomic.
+        reader = threading.Thread(target=_read, daemon=True, name="helper_v2-read")
+        reader.start()
+        reader.join(timeout)
+        if reader.is_alive():
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            _PROC = None
+            raise HelperError(
+                f"helper did not answer within {timeout}s; killed so the next call "
+                f"respawns it. stderr tail:\n{stderr_tail()}"
+            )
+        if "err" in box:
+            raise box["err"]
+        line = box["line"]
     try:
         resp = json.loads(line)
     except json.JSONDecodeError as e:

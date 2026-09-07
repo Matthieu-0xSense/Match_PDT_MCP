@@ -14,7 +14,7 @@ from mcp.server.fastmcp import FastMCP
 
 from parser import (
     HDB_PATH, PDT_DIR, _resolve_pdt_dir,
-    get_cache, clear_cache, get_errors,
+    get_cache, clear_cache, get_errors, get_can_buses,
     get_detection_methods as _get_detection_methods,
     get_fmi_definitions as _get_fmi_definitions,
     get_error_templates as _get_error_templates,
@@ -25,6 +25,11 @@ from parser import (
     update_db_variable as _update_db_variable,
     delete_db_variable as _delete_db_variable,
     add_custom_error as _add_custom_error,
+    list_custom_errors as _list_custom_errors,
+    update_custom_error as _update_custom_error,
+    delete_custom_error as _delete_custom_error,
+    delete_error_block as _delete_error_block,
+    repair_error_blocks as _repair_error_blocks,
 )
 from formatters import fmt_can_id, fmt_message, fmt_signal
 
@@ -698,7 +703,7 @@ def add_custom_error(
         dm_name: Detection method name (e.g. 'DM_US_HINDEX_EOB_NEW'). Must be unique.
         bit: Bit position within the block (0-7).
         spn: SPN number for the error. Must be unique.
-        block_name: Software error block name (e.g. 'ERR_INDEX_US'). UPPER_SNAKE_CASE, no spaces. Required when creating a new template. Used to create the TBlock in Ecu.TBlocks for code generation.
+        block_name: Software error block name (e.g. 'ERR_INDEX_US'). UPPER_SNAKE_CASE, no spaces. Required when creating a new template (creates the ERR TBlock). For an existing template it is derived from the template's linked block; pass it only to disambiguate.
         description: Error description text.
         severity: Severity level (1=info, 3=warning, 5=critical). Default 3.
         fmi: FMI name (e.g. 'FMI_31_CONDITION_EXISTS'). Default FMI_31.
@@ -723,18 +728,202 @@ def add_custom_error(
         return f"Error: {e}"
 
     if result.get("status") == "ok":
+        tblock = result.get('block_name', '') or '(not set)'
+        if result.get('tblock_guid'):
+            tblock += f" (GUID: {result['tblock_guid']})"
         lines = [
             f"OK — {result.get('message', '')}",
             f"  SPN: {result.get('spn')}",
-            f"  DM: {result.get('dm_name')} (GUID: {result.get('dm_guid', '')})",
+            f"  DM: {result.get('dm_name')} (GUID: {result.get('dm_guid') or '(block DM)'})",
             f"  Template: {result.get('template')}",
-            f"  TBlock: {result.get('block_name', '') or '(not set)'}",
-            f"  Error ObjectId: {result.get('object_id', '')}",
+            f"  TBlock: {tblock}",
+            f"  Error GUID: {result.get('error_guid', '')}",
             f"  New block: {result.get('new_block', False)}",
             "Cache cleared.",
         ]
         return "\n".join(lines)
     return f"Unexpected result: {result}"
+
+
+def _fmt_custom_error(e: dict) -> list[str]:
+    return [
+        f"  SPN {e['spn']:>5d}  {e['description']}",
+        f"           DM {e['dm_name']}  bit {e['bit']}  block {e['block_name']}"
+        f"  template '{e['template']}'",
+        f"           sev={e['severity']}  {e['fmi'] or '?'} / {e['fmi_extended'] or '?'}"
+        f"  set {e['set_debounce_ms']}ms/{e['set_threshold']}"
+        f"  rel {e['release_debounce_ms']}ms/{e['release_threshold']}",
+    ]
+
+
+@mcp.tool()
+def list_custom_errors() -> str:
+    """List custom (user-defined) errors with their ERR block, bit, detection method,
+    template and FMI names, followed by the used/free bits of every ERR block.
+
+    Use this before add_custom_error (to pick a free bit / existing template) and
+    before update_custom_error / delete_custom_error (to find the SPN).
+    Requires the PDT installation for the .NET helper.
+    """
+    try:
+        data = _list_custom_errors()
+    except Exception as e:
+        return f"Error loading custom errors: {e}"
+
+    errors = data.get("errors", [])
+    blocks = data.get("blocks", [])
+    lines = [f"**Custom Errors ({len(errors)})**\n"]
+    if not errors:
+        lines.append("  (none)")
+    for e in sorted(errors, key=lambda x: (x["block_name"], x["bit"])):
+        lines.extend(_fmt_custom_error(e))
+    lines.append(f"\n**ERR Blocks ({len(blocks)})**\n")
+    for b in blocks:
+        used = ", ".join(f"{u['bit']}={u['dm_name']}" for u in b["used_bits"]) or "-"
+        free = ", ".join(str(x) for x in b["free_bits"]) or "none"
+        lines.append(f"  {b['block_name']}  template '{b['template'] or '(none)'}'")
+        lines.append(f"    used: {used}")
+        lines.append(f"    free bits: {free}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def update_custom_error(
+    spn: int,
+    description: str = "",
+    comment: str = "",
+    severity: int = -1,
+    fmi: str = "",
+    fmi_extended: str = "",
+    set_debounce_ms: int = -1,
+    release_debounce_ms: int = -1,
+    set_threshold: int = -1,
+    release_threshold: int = -1,
+    new_spn: int = 0,
+    dm_name: str = "",
+) -> str:
+    """Modify an existing custom error (Errors.dat + project.dat, atomic).
+
+    Only the arguments you pass are changed; leave the others at their defaults
+    to keep the current values. Refuses to touch built-in (non-custom) errors.
+    Backup created before first write.
+
+    Args:
+        spn: SPN of the custom error to modify (see list_custom_errors).
+        description: New error description.
+        comment: New comment text.
+        severity: New severity (1=info, 3=warning, 5=critical). -1 keeps current.
+        fmi: New FMI name (e.g. 'FMI_31_CONDITION_EXISTS').
+        fmi_extended: New FMI extension name (e.g. 'FMIEX_GLOBAL').
+        set_debounce_ms: New set debounce in ms (0 disables). -1 keeps current.
+        release_debounce_ms: New release debounce in ms (0 disables). -1 keeps current.
+        set_threshold: New set threshold. -1 keeps current.
+        release_threshold: New release threshold. -1 keeps current.
+        new_spn: Renumber the error to this SPN (must be unused). 0 keeps current.
+        dm_name: Rename the detection method (must be unique across the project).
+    """
+    fields: dict = {}
+    if description: fields["description"] = description
+    if comment: fields["comment"] = comment
+    if severity >= 0: fields["severity"] = severity
+    if fmi: fields["fmi"] = fmi
+    if fmi_extended: fields["fmi_extended"] = fmi_extended
+    if set_debounce_ms >= 0: fields["set_debounce_ms"] = set_debounce_ms
+    if release_debounce_ms >= 0: fields["release_debounce_ms"] = release_debounce_ms
+    if set_threshold >= 0: fields["set_threshold"] = set_threshold
+    if release_threshold >= 0: fields["release_threshold"] = release_threshold
+    if new_spn: fields["new_spn"] = new_spn
+    if dm_name: fields["dm_name"] = dm_name
+    if not fields:
+        return "No changes specified. Provide at least one field to update."
+
+    try:
+        result = _update_custom_error(spn, **fields)
+    except Exception as e:
+        return f"Error: {e}"
+
+    if result.get("status") == "ok":
+        lines = [f"OK — {result.get('message', '')}"]
+        lines.extend(_fmt_custom_error(result["error"]))
+        lines.append("Cache cleared.")
+        return "\n".join(lines)
+    return f"Unexpected result: {result}"
+
+
+@mcp.tool()
+def delete_custom_error(spn: int) -> str:
+    """Delete a custom error and free its bit in the ERR block.
+
+    Removes the Errors.dat entry, resets the block's detection-method slot to its
+    default name, and drops the template/custom DM entries for that DM. The ERR
+    block and template stay (use delete_error_block to remove those).
+    Refuses to delete built-in (non-custom) errors. Backup created before first write.
+
+    Args:
+        spn: SPN of the custom error to delete (see list_custom_errors).
+    """
+    try:
+        result = _delete_custom_error(spn)
+    except Exception as e:
+        return f"Error: {e}"
+
+    if result.get("status") == "ok":
+        return f"OK — {result.get('message', '')}\nCache cleared."
+    return f"Unexpected result: {result}"
+
+
+@mcp.tool()
+def delete_error_block(block_name: str) -> str:
+    """Delete an ERR software block together with all its custom errors.
+
+    Also removes the error template when this was its last linked block.
+    Backup created before first write.
+
+    Args:
+        block_name: ERR block name (e.g. 'ERR_INDEX_US'), see list_custom_errors.
+    """
+    try:
+        result = _delete_error_block(block_name)
+    except Exception as e:
+        return f"Error: {e}"
+
+    if result.get("status") == "ok":
+        spns = ", ".join(str(s) for s in result.get("errors_removed", [])) or "none"
+        return (
+            f"OK — {result.get('message', '')}\n"
+            f"  Errors removed: {spns}\n"
+            f"  Template removed: {result.get('template_removed')}\n"
+            "Cache cleared."
+        )
+    return f"Unexpected result: {result}"
+
+
+@mcp.tool()
+def repair_error_blocks() -> str:
+    """Repair ERR blocks created by earlier versions of add_custom_error.
+
+    Symptom in PDT: the block's parameter grid shows an empty Block Name,
+    Block Behavior '- none -' and empty Error Count, although the generated
+    code is correct. Cause: the block's parameters were never registered in
+    the project's flat parameter list, and ERROR_COUNT was left at 8.
+    This registers them and recomputes ERROR_COUNT (= used bits) for every
+    ERR block. Safe to run repeatedly. Backup created before first write.
+    """
+    try:
+        result = _repair_error_blocks()
+    except Exception as e:
+        return f"Error: {e}"
+    if result.get("status") != "ok":
+        return f"Unexpected result: {result}"
+    lines = [f"OK — {result.get('message', '')}"]
+    for b in result.get("blocks", []):
+        lines.append(
+            f"  {b['block_name']}: params registered={b['params_registered']}, "
+            f"sections registered={b['sections_registered']}, "
+            f"ERROR_COUNT {b['error_count_before'] or '?'} -> {b['error_count']}"
+        )
+    lines.append("Cache cleared.")
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -987,19 +1176,24 @@ def list_can_buses() -> str:
 
     Use the bus number (1-indexed) with add_can_message to target a specific bus.
     """
-    data = get_cache()
-    buses = data.get("buses", [])
+    buses = get_can_buses()
     if not buses:
         return "No CAN buses found in the project."
 
-    lines = [f"**CAN Buses ({len(buses)})**\n"]
+    lines = [f"**CAN Buses ({len(buses)})**  (numbering = PDT project order)\n"]
     for i, bus in enumerate(buses, 1):
         total = bus["send_count"] + bus["recv_count"]
-        lines.append(
-            f"  Bus {i}: {bus['bus_id']}"
-            f"  ({total} messages: {bus['send_count']} send, {bus['recv_count']} recv)"
-        )
-        lines.append(f"    ECU:         {bus['ecu_id']}")
+        label = bus.get("name") or "(unnamed)"
+        extra = ""
+        if bus.get("bitrate"):
+            extra = f"  {bus['bitrate']} kbit/s"
+        if not bus.get("in_project", True):
+            extra += "  [ORPHAN: referenced by CanMessages.xml but not in project.dat; not usable]"
+        lines.append(f"  Bus {i}: {label}  {bus['bus_id']}{extra}")
+        lines.append(f"    {total} messages: {bus['send_count']} send, {bus['recv_count']} recv")
+        if bus.get("description"):
+            lines.append(f"    Description: {bus['description']}")
+        lines.append(f"    ECU:         {bus['ecu_id'] or '(none linked yet)'}")
         lines.append(f"    Send buffer: {bus['send_buffer'] or '(none)'}")
         lines.append(f"    Recv buffer: {bus['recv_buffer'] or '(none)'}")
     return "\n".join(lines)
@@ -1078,16 +1272,21 @@ def add_can_signal(
 # ---------------------------------------------------------------------------
 
 def _get_bus_info(bus: int) -> dict:
-    """Get bus info by 1-indexed bus number. Raises ValueError on invalid bus."""
-    data = get_cache()
-    buses = data.get("buses", [])
+    """Get bus info by 1-indexed bus number (PDT order). Raises ValueError on invalid bus."""
+    buses = get_can_buses()
     if not buses:
         raise ValueError("No CAN buses found in the project.")
     if bus < 1 or bus > len(buses):
         raise ValueError(
             f"Invalid bus number {bus}. Project has {len(buses)} bus(es). Use 1-{len(buses)}."
         )
-    return buses[bus - 1]
+    info = buses[bus - 1]
+    if not info.get("in_project", True):
+        raise ValueError(
+            f"Bus {bus} ({info['bus_id']}) is only referenced by CanMessages.xml and no longer "
+            f"exists in project.dat. Use list_can_buses and pick a bus that is in the project."
+        )
+    return info
 
 
 def _sub(parent, tag, text=None):
@@ -1240,6 +1439,11 @@ def add_can_message(
     if dlc < 0 or dlc > 8:
         return "DLC must be 0-8."
 
+    try:
+        bus_info = _get_bus_info(bus)
+    except ValueError as e:
+        return f"Error: {e}"
+
     params = {
         "name": name,
         "can_id": can_id,
@@ -1248,6 +1452,8 @@ def add_can_message(
         "cycle_time": cycle_time,
         "signals": signals,
         "bus": bus,
+        # GUID wins over the index inside the helper; both come from PDT's own order.
+        "bus_id": bus_info["bus_id"],
     }
     try:
         from helper_v2 import call as helper_v2_call, HelperError
@@ -1270,8 +1476,17 @@ def add_can_message(
 
 @mcp.tool()
 def reload_hdb() -> str:
-    """Force re-parse of the HDB file. Use after saving in PDT."""
+    """Force re-parse of the HDB file. Use after saving in PDT.
+
+    Also discards the .NET helper's in-memory copy of the project so the next
+    write tool reloads what is on disk instead of saving stale state over it.
+    """
     clear_cache()
+    try:
+        import helper_v2
+        helper_v2.invalidate("reload_hdb")
+    except Exception:
+        pass
     try:
         data = get_cache()
     except Exception as e:

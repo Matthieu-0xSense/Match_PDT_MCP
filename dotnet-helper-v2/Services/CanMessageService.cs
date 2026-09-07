@@ -210,9 +210,23 @@ namespace MatchPdt.Helper.Services
 
                 var canBusses = (IEnumerable)actualAgent.GetType().GetProperty("CanBusses")!.GetValue(actualAgent)!;
                 var busList = canBusses.Cast<object>().ToList();
-                if (busOneIndexed < 1 || busOneIndexed > busList.Count)
-                    throw new ArgumentException($"'bus' must be 1..{busList.Count}, got {busOneIndexed}");
-                var bus = busList[busOneIndexed - 1];
+                // Prefer an explicit bus GUID: the Python side numbers buses from the
+                // same Repo.CanBusses order, but a GUID can never drift.
+                var requestedBusId = req.GetStringParam("bus_id", "");
+                object bus;
+                if (!string.IsNullOrEmpty(requestedBusId))
+                {
+                    var wanted = Guid.Parse(requestedBusId);
+                    bus = busList.FirstOrDefault(b => (Guid)b.GetType().GetProperty("ObjectId")!.GetValue(b)! == wanted)
+                        ?? throw new ArgumentException($"bus_id {wanted} is not a CAN bus of this project");
+                    busOneIndexed = busList.IndexOf(bus) + 1;
+                }
+                else
+                {
+                    if (busOneIndexed < 1 || busOneIndexed > busList.Count)
+                        throw new ArgumentException($"'bus' must be 1..{busList.Count}, got {busOneIndexed}");
+                    bus = busList[busOneIndexed - 1];
+                }
                 var busId = (Guid)bus.GetType().GetProperty("ObjectId")!.GetValue(bus)!;
 
                 // First VirtualEcu (matches v1 single-ECU assumption — Phase 3 step 3 minimal scope)
@@ -354,17 +368,37 @@ namespace MatchPdt.Helper.Services
             var dtLoader = HostBootstrap.ResolveByReflection(dataTypeLoaderType)
                 ?? throw new InvalidOperationException("IDataTypeLoader not registered");
 
-            // Default datatype: TUINT8. For signals wider than 8 bits PDT auto-fits the
-            // size internally; ISignalService.SetSizeBits below sets the actual size.
+            // Data type per signal width, mirroring what the GUI produces (TBOOLEAN
+            // for 1 bit, TUINT8/16/32 otherwise; narrower widths keep the next type up,
+            // e.g. a 10-bit signal is TUINT16 with SizeBits=10).
+            // NOTE: ISignalService.SetSizeBits is a no-op for fixed-size types (all of
+            // the above), so the width has to be applied with CanSignal.With + repo
+            // Update — otherwise every signal is saved with the ctor default of 1 bit.
             var getByName = dataTypeLoaderType.GetMethod("GetByTypeName")!;
-            var defaultDataType = getByName.Invoke(dtLoader, new object[] { "TUINT8" })
-                ?? throw new InvalidOperationException("IDataTypeLoader.GetByTypeName('TUINT8') returned null");
-            var dataTypeId = (Guid)defaultDataType.GetType().GetProperty("GUID")!.GetValue(defaultDataType)!;
+            var dataTypeIdCache = new Dictionary<string, Guid>();
+            Guid DataTypeIdFor(int width)
+            {
+                var typeName = width <= 1 ? "TBOOLEAN" : width <= 8 ? "TUINT8" : width <= 16 ? "TUINT16" : "TUINT32";
+                if (!dataTypeIdCache.TryGetValue(typeName, out var id))
+                {
+                    var dt = getByName.Invoke(dtLoader, new object[] { typeName })
+                        ?? getByName.Invoke(dtLoader, new object[] { "TUINT8" })
+                        ?? throw new InvalidOperationException($"IDataTypeLoader.GetByTypeName('{typeName}') returned null");
+                    id = (Guid)dt.GetType().GetProperty("GUID")!.GetValue(dt)!;
+                    dataTypeIdCache[typeName] = id;
+                }
+                return id;
+            }
 
             // CanSignal convenience ctor: (ownerId, startBit, name, dataTypeId, appDataTypeId).
             var simpleSigCtor = canSignalType.GetConstructor(new[] { typeof(Guid), typeof(int), typeof(string), typeof(Guid), typeof(Guid) })!;
             var addSig = sigRepoType.GetMethod("Add")!;
-            var setSize = sigSvcType.GetMethod("SetSizeBits")!;
+            var updateSig = sigRepoType.GetMethod("Update")!;
+            var withMethod = canSignalType.GetMethod("With")!;
+            var withParams = withMethod.GetParameters();
+            var sizeBitsArgIndex = Array.FindIndex(withParams, p => p.Name == "sizeBits");
+            if (sizeBitsArgIndex < 0)
+                throw new InvalidOperationException("CanSignal.With has no 'sizeBits' parameter in this PDT version");
 
             foreach (var token in spec.Split(','))
             {
@@ -379,14 +413,20 @@ namespace MatchPdt.Helper.Services
                 if (!int.TryParse(parts[2].Trim(), out var sizeBits))
                     throw new ArgumentException($"sizeBits must be int in '{token}'");
 
+                if (sizeBits < 1 || sizeBits > 64)
+                    throw new ArgumentException($"sizeBits must be 1..64 in '{token}'");
+                var dataTypeId = DataTypeIdFor(sizeBits);
                 var signal = simpleSigCtor.Invoke(new object[] { messageId, startBit, sigName, dataTypeId, dataTypeId });
                 addSig.Invoke(sigRepo, new[] { signal });
 
                 if (sizeBits != 1)
                 {
-                    // SetSizeBits returns a new immutable CanSignal — repository.Update is
-                    // called inside the service.
-                    setSize.Invoke(sigSvc, new[] { signal, (object)sizeBits });
+                    // With() keeps a field when its arg is default/null: reflection turns a
+                    // null into default(T) for value types, so null everywhere but sizeBits.
+                    var args = new object?[withParams.Length];
+                    args[sizeBitsArgIndex] = (int?)sizeBits;
+                    signal = withMethod.Invoke(signal, args)!;
+                    updateSig.Invoke(sigRepo, new[] { signal });
                 }
 
                 Program.WriteLog($"  signal: {sigName} startBit={startBit} sizeBits={sizeBits}");

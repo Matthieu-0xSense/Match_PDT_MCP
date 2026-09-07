@@ -40,13 +40,32 @@ def _version_key(v):
         return (0,)
 
 
+# A version directory only counts as an install if the PDT runtime is present.
+# Uninstalled versions can leave a near-empty folder behind (e.g. 2.12.100 with
+# only a stray helper exe); picking that breaks every .dat tool with
+# "Impossible de trouver l'assembly 'Hydac.PDT.DataLayer.Implementation'".
+_PDT_RUNTIME_MARKER = "Hydac.PDT.PdtFramework.dll"
+
+
+def _pdt_dir_has_runtime(path: str) -> bool:
+    return bool(path) and os.path.isfile(os.path.join(path, _PDT_RUNTIME_MARKER))
+
+
+def _installed_pdt_dirs() -> list[str]:
+    """Installed PDT version dirs (with runtime), newest first."""
+    if not os.path.isdir(_PDT_BASE):
+        return []
+    versions = sorted(os.listdir(_PDT_BASE), key=_version_key, reverse=True)
+    return [os.path.join(_PDT_BASE, v) for v in versions
+            if _pdt_dir_has_runtime(os.path.join(_PDT_BASE, v))]
+
+
 # Default PDT_DIR: env var > latest installed version (fallback)
 PDT_DIR = os.environ.get("PDT_DIR", "")
 if not PDT_DIR:
-    if os.path.isdir(_PDT_BASE):
-        _versions = sorted(os.listdir(_PDT_BASE), key=_version_key, reverse=True)
-        if _versions:
-            PDT_DIR = os.path.join(_PDT_BASE, _versions[0])
+    _installed = _installed_pdt_dirs()
+    if _installed:
+        PDT_DIR = _installed[0]
 
 _pdt_dir_cache: dict[str, str] = {}
 
@@ -81,12 +100,13 @@ def _resolve_pdt_dir(hdb_path: str) -> str:
         parts = version.split(".")
         dir_version = ".".join(parts[:3])
         candidate = os.path.join(_PDT_BASE, dir_version)
-        if os.path.isdir(candidate):
+        if _pdt_dir_has_runtime(candidate):
             _pdt_dir_cache[hdb_path] = candidate
             return candidate
         else:
             import sys
-            print(f"[Match_PDT_MCP] Warning: PDT {dir_version} not installed, "
+            why = "not installed" if not os.path.isdir(candidate) else "folder has no PDT runtime"
+            print(f"[Match_PDT_MCP] Warning: PDT {dir_version} {why}, "
                   f"using {PDT_DIR}", file=sys.stderr)
 
     _pdt_dir_cache[hdb_path] = PDT_DIR
@@ -379,8 +399,13 @@ _cache: dict = {}
 
 
 def get_cache() -> dict:
-    """Return cached HDB data, loading on first access."""
-    if not _cache:
+    """Return cached HDB data, loading on first access.
+
+    Keyed on "messages_by_id" rather than emptiness: helper-backed lookups
+    (errors, buses) also park results in _cache, and a bare `if not _cache`
+    would then skip the XML load and KeyError on the next CAN/DB read.
+    """
+    if "messages_by_id" not in _cache:
         _cache.update(_load_hdb())
     return _cache
 
@@ -419,6 +444,13 @@ def _run_dotnet_helper(command: str, timeout: int = 30, stdin_data: str = None) 
     else:
         cmd = ["dotnet", "run", "-c", "Release", "--", HDB_PATH, pdt_dir] + command.split()
 
+    verb = command.split()[0]
+    is_write = verb in _V1_WRITE_COMMANDS
+    if is_write:
+        # The v1 helper rewrites the .hdb on disk. A running v2 helper still holds
+        # the pre-write project in memory and would clobber this on its next save.
+        _invalidate_helper_v2(f"v1 {verb}")
+
     result = subprocess.run(
         cmd,
         cwd=DOTNET_HELPER,
@@ -428,6 +460,71 @@ def _run_dotnet_helper(command: str, timeout: int = 30, stdin_data: str = None) 
     if result.returncode != 0:
         raise RuntimeError(f"dotnet helper failed: {result.stderr.strip()}")
     return json.loads(result.stdout)
+
+
+_V1_WRITE_COMMANDS = {"db-add-var", "db-update-var", "db-delete-var", "err-custom-add",
+                      "err-custom-update", "err-custom-delete", "err-block-delete",
+                      "err-blocks-repair"}
+
+
+def _invalidate_helper_v2(reason: str) -> None:
+    """Stop the long-lived v2 helper so its next use reloads the .hdb from disk."""
+    try:
+        import helper_v2
+        helper_v2.invalidate(reason)
+    except Exception as exc:  # noqa: BLE001 - never let this break a write
+        import sys
+        print(f"[Match_PDT_MCP] helper_v2 invalidate failed: {exc}", file=sys.stderr)
+
+
+def get_can_buses() -> list[dict]:
+    """CAN buses in PDT's own order (project.dat Repo.CanBusses), merged with
+    the per-bus message stats derived from the XML files.
+
+    The XML-only view (CanMessages.xml BusId order) can list buses in a
+    different order than PDT and can include buses that no longer exist in
+    project.dat. Each entry carries `in_project` so callers can tell.
+    Falls back to the XML-only list when the .NET helper is unavailable.
+    """
+    if "buses_merged" in _cache:
+        return _cache["buses_merged"]
+
+    data = get_cache()
+    xml_buses = {b["bus_id"]: b for b in data.get("buses", [])}
+    merged: list[dict] = []
+    try:
+        repo_buses = _run_dotnet_helper("can-list-buses", timeout=60)
+    except Exception as exc:  # noqa: BLE001 - degrade to XML view
+        import sys
+        print(f"[Match_PDT_MCP] can-list-buses unavailable ({exc}); "
+              f"bus numbering falls back to CanMessages.xml order", file=sys.stderr)
+        repo_buses = []
+
+    seen: set[str] = set()
+    for rb in repo_buses:
+        bid = rb.get("guid", "")
+        entry = dict(xml_buses.get(bid) or {
+            "bus_id": bid, "ecu_id": "", "send_buffer": "", "recv_buffer": "",
+            "send_count": 0, "recv_count": 0,
+        })
+        entry.update({
+            "name": rb.get("name", ""),
+            "hw_index": rb.get("hw_index"),
+            "bitrate": rb.get("bitrate"),
+            "description": rb.get("description", ""),
+            "in_project": True,
+        })
+        merged.append(entry)
+        seen.add(bid)
+    for bid, b in xml_buses.items():
+        if bid not in seen:
+            entry = dict(b)
+            entry.update({"name": "", "hw_index": None, "bitrate": None,
+                          "description": "", "in_project": not repo_buses})
+            merged.append(entry)
+
+    _cache["buses_merged"] = merged
+    return merged
 
 
 def get_errors() -> list[dict]:
@@ -545,6 +642,50 @@ def add_custom_error(template: str, dm_name: str, bit: int, spn: int,
     ref_hdb = _find_reference_hdb_with_err_block()
     payload = json.dumps({**params, "ref_hdb": ref_hdb})
     result = _run_dotnet_helper("err-custom-add", timeout=60, stdin_data=payload)
+    clear_cache()
+    return result
+
+
+def list_custom_errors() -> dict:
+    """Custom errors joined with their ERR block, bit, template and FMI names,
+    plus the used/free bits of every ERR block. Read-only."""
+    return _run_dotnet_helper("err-list-custom", timeout=60)
+
+
+def update_custom_error(spn: int, **fields) -> dict:
+    """Update fields of a custom error. Only keys present in `fields` change.
+
+    Accepted keys: description, comment, severity, fmi, fmi_extended,
+    set_debounce_ms, release_debounce_ms, set_threshold, release_threshold,
+    new_spn, dm_name.
+    """
+    payload = json.dumps({"spn": spn, **fields})
+    result = _run_dotnet_helper("err-custom-update", timeout=60, stdin_data=payload)
+    clear_cache()
+    return result
+
+
+def delete_custom_error(spn: int) -> dict:
+    """Remove a custom error and free its block bit."""
+    result = _run_dotnet_helper("err-custom-delete", timeout=60,
+                                stdin_data=json.dumps({"spn": spn}))
+    clear_cache()
+    return result
+
+
+def repair_error_blocks() -> dict:
+    """Register ERR-block params in the repo lists and resync ERROR_COUNT for
+    blocks created by earlier versions of add_custom_error. Idempotent."""
+    result = _run_dotnet_helper("err-blocks-repair", timeout=60, stdin_data="{}")
+    clear_cache()
+    return result
+
+
+def delete_error_block(block_name: str) -> dict:
+    """Remove an ERR block with all its errors and, if it was the last linked
+    block, its template."""
+    result = _run_dotnet_helper("err-block-delete", timeout=60,
+                                stdin_data=json.dumps({"block_name": block_name}))
     clear_cache()
     return result
 
@@ -677,6 +818,10 @@ def write_xml_to_hdb(filename: str, root: ET.Element) -> None:
     backup_path = HDB_PATH + ".bak"
     if not os.path.isfile(backup_path):
         shutil.copy2(HDB_PATH, backup_path)
+
+    # A running v2 helper holds the pre-edit project in memory; drop it so the
+    # next v2 call reloads this file instead of saving stale state over it.
+    _invalidate_helper_v2(f"xml write {filename}")
 
     # Write new archive to temp file, then replace original
     dir_name = os.path.dirname(HDB_PATH)

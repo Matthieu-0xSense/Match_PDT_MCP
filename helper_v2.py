@@ -36,6 +36,11 @@ _NEXT_ID = 1
 # exactly like a hung RPC call. Keep the pipe drained and the tail available
 # for error messages.
 _STDERR_TAIL: collections.deque = collections.deque(maxlen=400)
+# (path, mtime_ns, size) of the .hdb as the running helper last saw it. The helper
+# loads the project once and saves from memory; if anything else (an XML tool,
+# the v1 helper, the PDT GUI) rewrites the file in between, the helper's next
+# save would silently overwrite those changes. Compare before every call.
+_HDB_SIG: tuple | None = None
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 _HELPER_EXE = os.path.join(
     _REPO_ROOT, "dotnet-helper-v2", "bin", "Debug", "net48",
@@ -107,14 +112,48 @@ def stderr_tail(n: int = 40) -> str:
     return "\n".join(list(_STDERR_TAIL)[-n:])
 
 
+def _file_sig(path: str) -> tuple | None:
+    try:
+        st = os.stat(path)
+        return (os.path.abspath(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
 def _ensure(hdb_path: str, pdt_dir: str) -> subprocess.Popen:
-    """Get the running helper process, starting it on first use."""
-    global _PROC
+    """Get the running helper process, (re)starting it when needed.
+
+    Restarts when the helper died, when the target .hdb differs from the one it
+    loaded, or when the .hdb changed on disk since the helper last touched it.
+    """
+    global _PROC, _HDB_SIG
     with _LOCK:
-        if _PROC is None or _PROC.poll() is not None:
+        alive = _PROC is not None and _PROC.poll() is None
+        current = _file_sig(hdb_path)
+        if alive and _HDB_SIG != current:
+            print(f"[helper_v2] {hdb_path} changed on disk since the helper loaded it; "
+                  f"restarting so it does not save stale state over those changes",
+                  file=sys.stderr)
+            _shutdown_locked()
+            alive = False
+        if not alive:
             _PROC = _start(hdb_path, pdt_dir)
+            _HDB_SIG = _file_sig(hdb_path)
             atexit.register(_shutdown)
         return _PROC
+
+
+def invalidate(reason: str = "") -> None:
+    """Drop the running helper so the next call reloads the .hdb from disk.
+
+    Call after any write that bypasses the helper (XML edits, v1 helper writes,
+    a PDT GUI save the user reports). Cheap when no helper is running.
+    """
+    with _LOCK:
+        if _PROC is not None and _PROC.poll() is None:
+            print(f"[helper_v2] invalidating loaded project ({reason or 'external write'})",
+                  file=sys.stderr)
+        _shutdown_locked()
 
 
 def call(method: str, params: dict[str, Any] | None = None,
@@ -134,7 +173,7 @@ def call(method: str, params: dict[str, Any] | None = None,
         raise HelperError("HDB_PATH not set; cannot start dotnet-helper-v2")
 
     proc = _ensure(hdb_path, pdt_dir)
-    global _NEXT_ID, _PROC
+    global _NEXT_ID, _PROC, _HDB_SIG
     with _LOCK:
         req_id = _NEXT_ID
         _NEXT_ID += 1
@@ -189,6 +228,8 @@ def call(method: str, params: dict[str, Any] | None = None,
         if "err" in box:
             raise box["err"]
         line = box["line"]
+        # The helper may have just saved: adopt the new on-disk state as "ours".
+        _HDB_SIG = _file_sig(hdb_path)
     try:
         resp = json.loads(line)
     except json.JSONDecodeError as e:
@@ -202,9 +243,16 @@ def call(method: str, params: dict[str, Any] | None = None,
 
 def _shutdown() -> None:
     """Send shutdown then wait briefly for graceful exit."""
-    global _PROC
+    with _LOCK:
+        _shutdown_locked()
+
+
+def _shutdown_locked() -> None:
+    """Shutdown body; caller holds _LOCK. The shutdown verb does not save."""
+    global _PROC, _HDB_SIG
     proc = _PROC
     _PROC = None
+    _HDB_SIG = None
     if proc is None or proc.poll() is not None:
         return
     try:
@@ -214,7 +262,9 @@ def _shutdown() -> None:
     except Exception:
         pass
     try:
-        proc.wait(timeout=10)
+        # The shutdown verb never saves, so a forced kill loses nothing; keep the
+        # wait short because invalidate() sits on the path of every XML write.
+        proc.wait(timeout=3)
     except subprocess.TimeoutExpired:
         try:
             proc.kill()

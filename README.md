@@ -29,7 +29,7 @@ The PDT generates C code in `AUTO_CEN_*` folders — structs, enums, config arra
 
 **What can also be modified (binary .dat — via .NET helper):**
 - Database variables in `project.dat` — add, update, delete parameters across NvMem/RAM databases
-- Custom error definitions — add custom errors with error templates, detection methods, and ERR TBlocks (modifies both `project.dat` and `Errors.dat` atomically)
+- Custom error definitions — add, list, update and delete custom errors (and their ERR TBlocks) with error templates and detection methods (modifies both `project.dat` and `Errors.dat` atomically)
 
 **What cannot be modified:**
 - ISOBUS config (`Isobus.dat`)
@@ -108,7 +108,7 @@ The same `.mcp.json` works for any MATCH project — just drop it in the project
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `list_can_buses` | *(none)* | List all CAN buses with message counts, ECU IDs, and send/receive buffer IDs. Use the bus number with other tools. |
+| `list_can_buses` | *(none)* | List all CAN buses in PDT's own order (from `project.dat`) with name, bitrate, message counts, ECU IDs, and send/receive buffer IDs. The bus number is what `add_can_message` expects. Buses only referenced by `CanMessages.xml` but no longer in the project are flagged `[ORPHAN]`. |
 | `get_can_message` | `name: str`, `can_id: int` | Look up message by name (case-insensitive, substring match) or CAN ID (decimal). Returns details + all signals + direction. |
 | `list_can_messages` | `direction: str`, `name_filter: str`, `bus: int` | List all messages. Filter by direction (`send`/`receive`), name substring, or bus number. |
 | `get_can_signal` | `name: str`, `message: str` | Look up signal by name (case-insensitive). Returns scaling, bits, units, parent message. Use `message` to disambiguate duplicates. |
@@ -149,16 +149,9 @@ This creates:
 - ECU link with the correct send buffer for that bus
 - 3 signals: `testValue` (16-bit at bit 0), `status` (8-bit at bit 16), `mode` (4-bit at bit 24)
 
-**Important — Message Block assignment in PDT:**
+**Message Block:** `add_can_message` runs through PDT's own services (dotnet-helper-v2), so the ECU link and the CSND/CRCV software block are created in the same save — no manual Usage toggle in PDT is needed any more. Signal widths map to data types the way the GUI does (1 bit → `TBOOLEAN`, ≤8 → `TUINT8`, ≤16 → `TUINT16`, else `TUINT32`; narrower widths keep the next type up with the requested `SizeBits`).
 
-New messages are created with Usage matching the `direction` argument (`Receive`, `SendCyclically`, or `SendEventBased`) — current PDT versions reject any other value at project load. However, the CSND/CRCV software block (stored in `project.dat` as .NET binary serialization) **cannot** be created from XML alone, so the message is still incomplete until PDT touches it. To finalize the message:
-
-1. Open the project in PDT
-2. Go to the message → **Network** tab
-3. Re-select **Usage** (toggle off and back to `TXC` for send / `RXC` for receive)
-4. PDT auto-creates the Message Block
-
-After this step, the message is fully configured and code generation will include the `gCSnd_t*` / `gCRcv_t*` structs.
+Note that `add_can_signal` still writes `CanSignals.xml` directly with the project's default data type and `VAR_MAX` bounds, which PDT flags as a warning (PDT1205) for 8-bit signals; prefer passing all signals to `add_can_message`. In practice a DBC import in PDT covers most CAN definition work; these tools are for small additions.
 
 **Visual walkthrough:**
 
@@ -194,6 +187,11 @@ These tools are optional. Without .NET SDK, they return an error message; all ot
 | `list_detection_methods` | `filter: str` | List detection methods with bit positions and FMI values. |
 | `list_fmi_definitions` | *(none)* | List FMI and FMI extension definitions with GUIDs. |
 | `add_custom_error` | `template`, `dm_name`, `bit`, `spn`, `block_name`, `description`, `severity`, `fmi`, `fmi_extended`, debounce/threshold params | Add a custom error with detection method, error template, and ERR TBlock. Works on projects with or without existing custom errors. |
+| `list_custom_errors` | *(none)* | Custom errors only, each with its ERR block, bit, detection method, template and FMI names, plus the used/free bits of every ERR block. Start here before adding, updating or deleting. |
+| `update_custom_error` | `spn`, then any of `description`, `comment`, `severity`, `fmi`, `fmi_extended`, `set_debounce_ms`, `release_debounce_ms`, `set_threshold`, `release_threshold`, `new_spn`, `dm_name` | Change fields of a custom error, rename its detection method, or renumber its SPN. Only the arguments passed change. Refuses built-in errors. |
+| `delete_custom_error` | `spn` | Remove a custom error and free its bit in the ERR block (slot name back to `DM_ERR_NN`, template and custom-DM entries dropped). Block and template stay. Refuses built-in errors. |
+| `delete_error_block` | `block_name` | Remove an ERR block with all its custom errors; the template goes too when this was its last linked block. |
+| `repair_error_blocks` | *(none)* | Fix ERR blocks made by older versions of `add_custom_error`: registers their parameters in the project's flat parameter list and recomputes `ERROR_COUNT`. Symptom it cures: empty Block Name / Behavior "- none -" / empty Error Count in PDT's block grid while generated code is fine. Idempotent. |
 
 **`add_custom_error` details:**
 
@@ -203,18 +201,20 @@ Creates a complete custom error entry in the PDT project (atomic operation — m
 - `dm_name` (required): Detection method name, e.g. `"DM_US_HINDEX_EOB"`. Must be unique.
 - `bit` (required): Bit position within the block (0-7).
 - `spn` (required): SPN number. Must be unique across all errors.
-- `block_name`: Software error block name, e.g. `"ERR_INDEX_US"`. Required when creating a new template. Used as the TBlock name for code generation.
+- `block_name`: Software error block name, e.g. `"ERR_INDEX_US"`. Required when creating a new template (it becomes the ERR TBlock name used for code generation). For an existing template it is derived from the template's linked block; pass it only to disambiguate. The error always points at that block's detection-method slot for `bit` — PDT only recognizes errors linked to a block DM, a template-only DM is dropped at load.
 - `description`: Error description text.
 - `severity`: 1=info, 3=warning (default), 5=critical.
 - `fmi`: FMI name, default `"FMI_31_CONDITION_EXISTS"`.
 - `fmi_extended`: FMI extension, default `"FMIEX_GLOBAL"`.
 - Debounce/threshold: `set_debounce_ms` (500), `release_debounce_ms` (0), `set_threshold` (500), `release_threshold` (1000).
 
+**Managing existing custom errors:** `list_custom_errors` → `update_custom_error` / `delete_custom_error` / `delete_error_block`. All of them go through the same XML-direct helper as `add_custom_error` and undo exactly what it registers (Errors.dat entry, block slot `CustomName`, `Custom.DetectionMethods`, the template's `Error` list, `LinkedBlockIds`, and the repo-level block/section/param/DM lists for a block delete). "Custom" means the error's detection method is a renamed slot of an ERR block; built-in errors are refused.
+
 **What gets created:**
 1. **Error template** in `Custom.ErrorTemplates` (if new)
 2. **Detection method entries** in `Custom.DetectionMethods` and the template's `Error` list
 3. **Error entry** in `Errors.dat` with SPN, severity, FMI, debounce settings
-4. **ERR TBlock** with 8 detection method slots (bits 0-7), block parameters (SW_MODULE, BLOCK_NAME, ERROR_COUNT), and the Standard library ERR blueprint
+4. **ERR TBlock** with 8 detection method slots (bits 0-7), block parameters (SW_MODULE, BLOCK_NAME, BLOCK_BEHAVIOR, BLOCK_DESCR = template name, ERROR_COUNT = number of used bits, kept in sync on add/delete), registered in `Repo.Blocks`, `Repo.BlockParamSections` and `Repo.BlockParams` like a GUI-made block, and the Standard library ERR blueprint
 5. **Template-to-TBlock link** via `LinkedBlockIds`
 
 When the project has no existing ERR blocks, the tool auto-discovers a sibling project with ERR blocks (in `C:\Match\Projects\`) and clones the block structure from there, including TBlockParamSections and TDetectionMethods.
@@ -286,12 +286,13 @@ Compares all XML files (element-level by ID/Name) and all .dat files (JSON deep-
 ## Limitations
 
 - **Most `.dat` files are read-only** — `project.dat` (database variables, custom errors/templates) and `Errors.dat` (error entries) support write-back. The generic `dump` command can read all .dat files to JSON for diffing.
-- **PDT version matching** — the server auto-matches the PDT installation to the project's version (from `info.xml`). If the exact version is not installed, it falls back to the latest available and logs a warning.
+- **PDT version matching** — the server auto-matches the PDT installation to the project's version (from `info.xml`). A version folder only counts if it still contains the PDT runtime (`Hydac.PDT.PdtFramework.dll`); an uninstalled version that left an empty folder behind is skipped. If the exact version is not installed, it falls back to the latest available and logs a warning.
+- **One writer at a time** — `dotnet-helper-v2` keeps the project in memory between calls and saves from that copy. The server restarts it automatically whenever the `.hdb` changes on disk (an XML tool, the v1 helper, or a PDT save) and after `reload_hdb`, so stale state is never written back. Do not run write tools while the project is open in PDT: PDT holds its own in-memory copy and its next save will overwrite the MCP's changes (and vice-versa). Save and close in PDT first, or call `reload_hdb` after a PDT save.
 - **ERR block cloning** — when adding custom errors to a project without existing ERR blocks, the tool searches sibling projects for an ERR block to clone structure from. If no reference project is found, the error template and detection method are still created, but without a TBlock.
 - **Pin name resolution** requires cross-referencing GUIDs through `project.dat`. The `dump project.dat` command now exposes pin data.
 - **Error GUID fields** (Fmi, DetectionMethod, MachineFunction, RestrictedMode) reference objects in `project.dat` and can't be resolved to names.
 - **Signal name duplicates** — many signals share the same name across different messages. Use the `message` parameter in `get_can_signal` to disambiguate.
-- **CAN Message Blocks** — `add_can_message` cannot create CSND/CRCV software blocks (stored in `project.dat` binary format). New messages are written with Usage = `Receive` / `SendCyclically` / `SendEventBased` matching the `direction` arg, but the user must still re-touch the Usage field in PDT's Network tab so PDT generates the Message Block.
+- **CAN Message Blocks** — created by `add_can_message` via PDT's `ICanMessageEcuLinkService.SetNewUsage`; no manual step in PDT. `add_can_signal` (XML-direct) cannot touch the block, which is fine for signals but means it never validates bit overlaps.
 
 ## Dependencies
 

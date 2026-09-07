@@ -21,7 +21,7 @@ using System.Xml.Linq;
 ///            db-list-vars [database], db-get-var &lt;database&gt; &lt;variable&gt;,
 ///            db-add-var, db-update-var, db-delete-var
 /// </summary>
-class Program
+partial class Program
 {
     static int Main(string[] args)
     {
@@ -62,7 +62,9 @@ class Program
         {
             // Write commands need the hdbPath for re-writing; read commands use ZipFile.OpenRead
             if (command == "db-add-var" || command == "db-update-var" || command == "db-delete-var"
-                || command == "err-custom-add")
+                || command == "err-custom-add" || command == "err-custom-update"
+                || command == "err-custom-delete" || command == "err-block-delete"
+                || command == "err-blocks-repair")
             {
                 // Read JSON payload from stdin
                 string stdinJson = Console.In.ReadToEnd();
@@ -72,6 +74,10 @@ class Program
                     "db-update-var" => DbUpdateVar(hdbPath, stdinJson),
                     "db-delete-var" => DbDeleteVar(hdbPath, stdinJson),
                     "err-custom-add" => CustomErrorAdd(hdbPath, stdinJson),
+                    "err-custom-update" => CustomErrorUpdate(hdbPath, stdinJson),
+                    "err-custom-delete" => CustomErrorDelete(hdbPath, stdinJson),
+                    "err-block-delete" => ErrBlockDelete(hdbPath, stdinJson),
+                    "err-blocks-repair" => ErrBlocksRepair(hdbPath),
                     _ => throw new ArgumentException($"Unknown command: {command}")
                 };
                 Console.Write(json);
@@ -93,6 +99,8 @@ class Program
                 "err-list-dms" => ReadDetectionMethods(zip, args.Length > 3 ? args[3] : ""),
                 "err-list-fmis" => ReadFmiDefinitions(zip),
                 "err-list-templates" => ReadErrorTemplates(zip),
+                "can-list-buses" => CanListBuses(zip),
+                "err-list-custom" => ErrListCustom(zip),
                 _ => throw new ArgumentException($"Unknown command: {command}")
             };
             Console.Write(result);
@@ -293,6 +301,37 @@ class Program
             }
         }
 
+        return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+    }
+
+    /// <summary>
+    /// CAN buses in PDT's own order (Repo.CanBusses). This is the order the
+    /// PDT GUI and the v2 helper use for "bus N"; CanMessages.xml only carries
+    /// BusId GUIDs and can reference buses that were since deleted.
+    /// </summary>
+    static string CanListBuses(ZipArchive zip)
+    {
+        var dataLayer = Deserialize(zip, "project.dat");
+        var repo = GetProp(dataLayer, "Repo");
+        var buses = repo != null ? GetProp(repo, "CanBusses") as IList : null;
+        var result = new List<object>();
+        if (buses != null)
+        {
+            int index = 1;
+            foreach (var bus in buses)
+            {
+                if (bus == null || bus is string) continue;
+                result.Add(new
+                {
+                    index = index++,
+                    guid = GetPropValue<string>(bus, "GUID") ?? GetPropValue<string>(bus, "ObjectId") ?? "",
+                    name = GetPropValue<string>(bus, "Name") ?? "",
+                    hw_index = GetPropValue<int>(bus, "CanBus"),
+                    bitrate = GetPropValue<int>(bus, "Bitrate"),
+                    description = GetPropValue<string>(bus, "Description") ?? "",
+                });
+            }
+        }
         return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
     }
 
@@ -1625,7 +1664,8 @@ class Program
                 dmGuid = Guid.NewGuid().ToString();
                 SetProp(newDm, "Detection", dmName);
                 SetProp(newDm, "DetectionVm", dmName);
-                SetProp(newDm, "DetectionMethodName", dmName);
+                // GUI keeps the slot name here (DM_ERR_NN); the custom name lives in Detection.
+                SetProp(newDm, "DetectionMethodName", $"DM_ERR_{bit:D2}");
                 SetProp(newDm, "Bit", bit);
                 try { SetProp(newDm, "GroupName", template); } catch { }
                 try { SetProp(newDm, "Description", description); } catch { }
@@ -1701,6 +1741,39 @@ class Program
             const string ERR_BLUEPRINT_GUID = "65e013fd-1bb0-4c28-ac30-7b8d5e51effd";
             const string ERR_BLUEPRINT_VERSION = "0.1.3.0";
 
+            // Existing template, no block_name given: the error MUST still point at the
+            // TDetectionMethod of the ERR block linked to that template. PDT only
+            // recognizes an error whose DetectionMethod resolves to a block DM
+            // (Repo.DetectionMethod); a template-level DM GUID is discarded on load,
+            // leaving DetectionMethod/OwnerId empty and the error orphaned in the GUI.
+            // Derive the block from the template's LinkedBlockIds.
+            if (!newTemplate && string.IsNullOrEmpty(blockName))
+            {
+                var linked = GetProp(targetTemplate, "LinkedBlockIds") as IList;
+                if (linked != null)
+                {
+                    foreach (var linkedId in linked)
+                    {
+                        string wanted = linkedId?.ToString() ?? "";
+                        if (string.IsNullOrEmpty(wanted)) continue;
+                        for (int i = 0; i < tblocks.Count; i++)
+                        {
+                            if (tblocks[i] == null || tblocks[i] is string) continue;
+                            var candidateId = GetPropValue<string>(tblocks[i], "ObjectId") ?? "";
+                            if (candidateId.Equals(wanted, StringComparison.OrdinalIgnoreCase))
+                            {
+                                blockName = GetPropValue<string>(tblocks[i], "Name") ?? "";
+                                break;
+                            }
+                        }
+                        if (!string.IsNullOrEmpty(blockName)) break;
+                    }
+                }
+                if (string.IsNullOrEmpty(blockName))
+                    throw new InvalidOperationException(
+                        $"Template '{template}' has no linked ERR block; pass block_name explicitly.");
+            }
+
             if (!string.IsNullOrEmpty(blockName))
             {
                 if (newTemplate)
@@ -1709,6 +1782,7 @@ class Program
                     bool hasSourceBlock = sourceBlockIdx >= 0;
                     object sourceBlock = hasSourceBlock ? tblocks[sourceBlockIdx] : null;
                     string blockGuid = Guid.NewGuid().ToString();
+                    string newBlockDmGuid = "";
 
                     // Resolve TBlock type: from source block or from the tblocks collection
                     Type tblockType;
@@ -2049,7 +2123,10 @@ class Program
                                 repoDMs.Add(newBdm);
 
                                 if (bdmBit == bit)
+                                {
                                     SetProp(newError, "DetectionMethod", bdmGuid);
+                                    newBlockDmGuid = bdmGuid;
+                                }
                             }
                         }
                     }
@@ -2198,7 +2275,10 @@ class Program
                                     repoDMs.Add(newBdm);
 
                                     if (bdmBit == bit)
+                                    {
                                         SetProp(newError, "DetectionMethod", bdmGuid);
+                                        newBlockDmGuid = bdmGuid;
+                                    }
                                 }
                             }
                         }
@@ -2211,17 +2291,12 @@ class Program
                     if (repoBlocks != null)
                         repoBlocks.Add(newBlock);
 
-                    // Register TBlockParamSections in Repo.BlockParamSections
-                    var repoSections = GetProp(repo, "BlockParamSections") as IList;
-                    var blockSections = GetProp(newBlock, "TBlockParamSections") as IList;
-                    if (repoSections != null && blockSections != null)
-                    {
-                        foreach (var s in blockSections)
-                        {
-                            if (s != null && !(s is string))
-                                repoSections.Add(s);
-                        }
-                    }
+                    // Register sections AND params in the repo's flat lists. The GUI's
+                    // block-parameter grid resolves through Repo.BlockParams; without
+                    // it the block compiles but shows empty Name/Behavior/Count cells.
+                    RegisterBlockParams(repo, newBlock);
+                    SetBlockParamText(newBlock, "BLOCK_DESCR", template, null);
+                    SyncErrorCount(newBlock);
 
                     // Link template
                     var linkedIds = GetProp(targetTemplate, "LinkedBlockIds") as IList;
@@ -2236,6 +2311,7 @@ class Program
                         template,
                         block_name = blockName,
                         tblock_guid = blockGuid,
+                        dm_guid = newBlockDmGuid,
                         error_guid = errGuid,
                         new_block = true,
                         message = $"Created new error block '{template}' with TBlock '{blockName}' and SPN {spn}."
@@ -2244,42 +2320,55 @@ class Program
                 else
                 {
                     // Existing template: find TBlock by name and update DM CustomName
+                    string linkedBdmGuid = "";
+                    bool blockFound = false;
                     for (int i = 0; i < tblocks.Count; i++)
                     {
                         if (tblocks[i] == null || tblocks[i] is string) continue;
-                        if ((GetPropValue<string>(tblocks[i], "Name") ?? "") == blockName)
+                        if (!(GetPropValue<string>(tblocks[i], "Name") ?? "").Equals(blockName, StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        blockFound = true;
+                        blockName = GetPropValue<string>(tblocks[i], "Name") ?? blockName;
+                        var existDMs = GetProp(tblocks[i], "TDetectionMethods") as IList;
+                        if (existDMs != null)
                         {
-                            var existDMs = GetProp(tblocks[i], "TDetectionMethods") as IList;
-                            if (existDMs != null)
+                            foreach (var bdm in existDMs)
                             {
-                                foreach (var bdm in existDMs)
-                                {
-                                    if (bdm == null || bdm is string) continue;
-                                    if (GetPropValue<int>(bdm, "Bit") == bit)
-                                    {
-                                        SetProp(bdm, "CustomName", dmName);
-                                        // Update error to point to this TBlock DM
-                                        string bdmGuid = GetPropValue<string>(bdm, "ObjectId") ?? "";
-                                        if (!string.IsNullOrEmpty(bdmGuid))
-                                            SetProp(newError, "DetectionMethod", bdmGuid);
-                                        break;
-                                    }
-                                }
+                                if (bdm == null || bdm is string) continue;
+                                if (GetPropValue<int>(bdm, "Bit") != bit) continue;
+                                var current = GetPropValue<string>(bdm, "CustomName") ?? "";
+                                if (!string.IsNullOrEmpty(current) && current != $"DM_ERR_{bit:D2}" && current != dmName)
+                                    throw new ArgumentException(
+                                        $"Bit {bit} of block '{blockName}' is already used by '{current}'.");
+                                SetProp(bdm, "CustomName", dmName);
+                                // Point the error at this TBlock DM - the only kind PDT resolves.
+                                linkedBdmGuid = GetPropValue<string>(bdm, "ObjectId") ?? "";
+                                break;
                             }
-                            break;
                         }
+                        // Keep the block's bookkeeping the way the GUI would: params
+                        // registered in the repo lists, ERROR_COUNT = used slots.
+                        RegisterBlockParams(repo, tblocks[i]);
+                        SyncErrorCount(tblocks[i]);
+                        break;
                     }
+                    if (!blockFound)
+                        throw new ArgumentException($"ERR block '{blockName}' not found in project.");
+                    if (string.IsNullOrEmpty(linkedBdmGuid))
+                        throw new InvalidOperationException($"Block '{blockName}' has no detection method slot for bit {bit}.");
+                    SetProp(newError, "DetectionMethod", linkedBdmGuid);
 
                     resultJson = JsonSerializer.Serialize(new
                     {
                         status = "ok",
                         spn,
                         dm_name = dmName,
+                        dm_guid = linkedBdmGuid,
                         template,
                         block_name = blockName,
                         error_guid = errGuid,
                         new_block = false,
-                        message = $"Added DM '{dmName}' at bit {bit} to existing template '{template}' with SPN {spn}."
+                        message = $"Added DM '{dmName}' at bit {bit} to block '{blockName}' (template '{template}') with SPN {spn}."
                     }, new JsonSerializerOptions { WriteIndented = true });
                 }
             }

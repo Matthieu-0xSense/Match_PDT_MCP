@@ -582,6 +582,7 @@ namespace MatchPdt.Helper.Services
                 // Set default value in each ITValue's Detail.Defaults.
                 if (!string.IsNullOrEmpty(defaultVal))
                 {
+                    SetIsArray(itVar, SplitDefault(defaultVal).Length > 1);
                     var values = (IEnumerable)varT.GetProperty("Values")!.GetValue(itVar)!;
                     int valueCount = 0;
                     foreach (var v in values)
@@ -691,9 +692,60 @@ namespace MatchPdt.Helper.Services
             // was based on a misreading of the store: PDT validates every entry in
             // Defaults as a complete value, so "FALSE" produced five errors (F, A,
             // L, S, E) and "600000" silently became a default of 6.
+            // An array default arrives as "[a,b,c]" and becomes one entry per element: that
+            // is how PDT stores arrays (hIndexWeights carries seven entries), the element
+            // count being the array length. A scalar is the one-element case.
             defaults.Clear();
-            var entry = createOne.Invoke(factory, new object[] { defaultStr });
-            if (entry != null) defaults.Add(entry);
+            foreach (var element in SplitDefault(defaultStr))
+            {
+                var entry = createOne.Invoke(factory, new object[] { element });
+                if (entry != null) defaults.Add(entry);
+            }
+        }
+
+        /// <summary>"[1, 2, 3]" → {"1","2","3"}; anything else → {itself}.</summary>
+        /// <summary>PDT refuses longer arrays in its own validation (DatabaseVariableArrayLengthValidationAlgorithm).</summary>
+        internal const int MaxArrayLength = 31;
+
+        internal static string[] SplitDefault(string defaultStr)
+        {
+            var t = defaultStr.Trim();
+            if (t.Length >= 2 && t[0] == '[' && t[t.Length - 1] == ']')
+            {
+                var elements = t.Substring(1, t.Length - 2).Split(',').Select(x => x.Trim()).ToArray();
+                if (elements.Length > MaxArrayLength)
+                    throw new ArgumentException(
+                        $"Array default has {elements.Length} elements; PDT allows at most {MaxArrayLength}. Split it.");
+                return elements;
+            }
+            return new[] { t };
+        }
+
+        /// <summary>Flag the variable as an array when its default carries more than one element.</summary>
+        internal static void SetIsArray(object itVar, bool isArray)
+        {
+            // project.dat stores this as TVar.gcVarFunction, one byte: 0 scalar, 1 array (EVarFunc.VArray).
+            // VarFunctionByte is the public setter over it on both ITVar and TVar; IsArray on the
+            // class is read-only, which is why an earlier probe on it changed nothing.
+            var t = itVar.GetType();
+            var pb = t.GetProperty("VarFunctionByte", AnyInstance);
+            if (pb != null && pb.CanWrite)
+            {
+                pb.SetValue(itVar, Convert.ChangeType(isArray ? 1 : 0, pb.PropertyType));
+                Program.WriteLog($"VarFunctionByte={(isArray ? 1 : 0)} set on {t.Name}");
+                return;
+            }
+            var pf = t.GetProperty("VarFunction", AnyInstance);
+            if (pf != null && pf.CanWrite && pf.PropertyType.IsEnum)
+            {
+                var name = isArray ? "VArray" : Enum.GetNames(pf.PropertyType)[0];
+                pf.SetValue(itVar, Enum.Parse(pf.PropertyType, name));
+                Program.WriteLog($"VarFunction={name} set on {t.Name}");
+                return;
+            }
+            var p = t.GetProperty("IsArray", AnyInstance);
+            if (p != null && p.CanWrite) { p.SetValue(itVar, isArray); Program.WriteLog($"IsArray={isArray} set on {t.Name}"); return; }
+            Program.WriteLog("WARNING: no writable VarFunctionByte/VarFunction/IsArray on " + t.FullName);
         }
 
         public static RpcResponse UpdateDbVariable(HostBootstrap host, RpcRequest req)
@@ -714,6 +766,7 @@ namespace MatchPdt.Helper.Services
                     // Same TRUE/FALSE → 1/0 mapping the create path applies.
                     var existingType = varT.GetProperty("VarType")?.GetValue(itVar)?.ToString() ?? "";
                     defaultVal = NormalizeDefault(existingType, defaultVal);
+                    SetIsArray(itVar, SplitDefault(defaultVal).Length > 1);
                     var values = (IEnumerable)varT.GetProperty("Values")!.GetValue(itVar)!;
                     foreach (var v in values) SetDefaultOnTValue(v, defaultVal);
                     changed = true;
